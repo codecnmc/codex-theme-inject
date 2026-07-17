@@ -1,0 +1,6 @@
+/target/
+*.log
+output/
+design-qa.md
+.codegraph/
+.playwright-cli/
