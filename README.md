@@ -29,6 +29,10 @@ Theme Inject 会通过 Chromium DevTools Protocol（CDP）把主题运行时注�
 
 ![高达主题](images/高达主题.png)
 
+![CLANNAD 团子大家族主题](images/clannad主题.png)
+
+![雨姐主题](images/雨姐主题.png)
+
 ![主题示例](images/主题2.png)
 
 ## 使用方法
@@ -86,6 +90,8 @@ target\release\theme-inject.exe
 powershell -ExecutionPolicy Bypass -File .\scripts\restart-dev.ps1
 ```
 
+推送到 `clean-version` 分支时，GitHub Actions 会自动运行测试、构建 Windows Release，并上传包含程序、README 和示例主题包的 ZIP 构件。
+
 ## 有没有风险
 
 Theme Inject 不会修改 Codex 的 `app.asar`、安装目录或 `~/.codex` 配置，它是通过 CDP 在运行时注入主题脚本。
@@ -117,6 +123,12 @@ assets/
 ```
 
 导入主题后，主题会进入主题库；点击卡片即可立即切换。导出的 ZIP 会包含主题配置和引用的本地图片资源。
+
+仓库提供以下示例主题包，可下载后在主题库中直接导入：
+
+- [团子大家族主题](themes/团子大家族主题.zip)
+- [雨姐主题](themes/雨姐主题.zip)
+- [高达主题](themes/高达主题.zip)
 
 ## 开发验证
 

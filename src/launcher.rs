@@ -532,6 +532,12 @@ impl ThemeService {
                     Some(string_param(&params, "session")?),
                 )?
             })),
+            "theme.preview.thumbnail" => Ok(json!({
+                "url": packages.staging_thumbnail_data_url(
+                    string_param(&params, "session")?,
+                    string_param(&params, "path")?,
+                )?
+            })),
             "theme.asset.import" => {
                 let id = string_param(&params, "id")?;
                 let theme = self.themes.load(id)?;

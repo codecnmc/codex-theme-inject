@@ -21,6 +21,7 @@
   const callbacks = new Map();
   let assetUrls = new Map();
   const stagedUrls = new Map();
+  const thumbnailUrls = new Map();
   const ASSET_RETRY_DELAYS = [250, 750, 1500, 3000, 6000, 12000, 30000];
   let requestSequence = 0;
   let destroyed = false;
@@ -33,6 +34,10 @@
   let dirty = false;
   let activeTab = "library";
   let mutationTimer = 0;
+  let draftPreviewTimer = 0;
+  let draftPreviewDeadline = 0;
+  let studioPreviewTimer = 0;
+  let studioPreviewDeadline = 0;
   let modal = null;
   let busy = false;
   let statusMessage = "";
@@ -53,6 +58,7 @@
   let studioOpen = false;
   let studioTab = "generate";
   let studioTimer = 0;
+  let studioProgressSignature = "";
   let generationEpoch = 0;
   let assetHydrationEpoch = 0;
   let assetCacheThemeId = "";
@@ -63,9 +69,11 @@
   let studioSelectedDecoration = -1;
   let studioSaveOpen = false;
   let aiGeneratedDraft = false;
+  let studioBaseline = null;
   let panelScrollTop = 0;
   let studioPaneScrollTop = 0;
   let activeDecorationDragCleanup = null;
+  let layoutResizeTarget = null;
   let brandSignature = "";
   let decorationsSignature = "";
   let homeSignature = "";
@@ -87,7 +95,7 @@
       const id = `${Date.now()}-${++requestSequence}`;
       const timeout = method === "ai.generate"
         ? 25 * 60 * 1000
-        : ["theme.preview.data", "theme.background.data"].includes(method)
+        : ["theme.preview.data", "theme.preview.thumbnail", "theme.background.data"].includes(method)
           ? 2 * 60 * 1000
           : ["theme.package.import", "theme.package.export", "theme.background.import", "theme.asset.import", "ai.reference.import", "ai.reference.upload"].includes(method)
             ? 10 * 60 * 1000
@@ -186,26 +194,28 @@
   }
   function resolvedAsset(theme, relative) { return stagedUrls.get(relative) || (assetCacheThemeId === theme?.id ? assetUrls.get(relative) : "") || assetUrl(theme, relative); }
   function isPreviewDataUrl(value) { return typeof value === "string" && value.startsWith("data:image/"); }
+  function isPreviewImageUrl(value) { return isPreviewDataUrl(value) || (typeof value === "string" && /^https?:\/\//i.test(value)); }
   async function previewDataUrl(asset) {
-    const cached = isPreviewDataUrl(asset?.previewUrl) ? asset.previewUrl : "";
+    const cached = thumbnailUrls.get(asset?.path) || "";
     if (cached || !asset?.session || !asset?.path) return cached;
     try {
-      const result = await call("theme.preview.data", { session: asset.session, path: asset.path });
-      return isPreviewDataUrl(result.url) ? result.url : "";
+      const result = await call("theme.preview.thumbnail", { session: asset.session, path: asset.path });
+      const url = isPreviewDataUrl(result.url) ? result.url : "";
+      if (url && asset?.path) thumbnailUrls.set(asset.path, url);
+      return url;
     } catch {
       return "";
     }
   }
   async function loadStagedAssetUrls(assets, shouldContinue = () => true) {
-    const urls = new Map();
-    for (const asset of assets || []) {
-      if (!asset?.path) continue;
-      const cached = stagedUrls.get(asset.path);
-      const url = isPreviewDataUrl(cached) ? cached : await previewDataUrl(asset);
-      if (!shouldContinue()) return null;
-      asset.previewUrl = url;
-      if (url) urls.set(asset.path, url);
-    }
+    const loaded = await mapConcurrent((assets || []).filter(asset => asset?.path), 3, async asset => {
+      try {
+        const result = await call("theme.preview.data", { session: asset.session, path: asset.path });
+        return [asset.path, isPreviewDataUrl(result.url) ? result.url : ""];
+      } catch { return [asset.path, ""]; }
+    });
+    if (!shouldContinue()) return null;
+    const urls = new Map(loaded.filter(([, url]) => url));
     return urls;
   }
   async function cacheStagedAssetUrls(assets, shouldContinue = () => true) {
@@ -235,6 +245,31 @@
     (theme.skin?.decorations || []).forEach(item => item.asset && paths.add(item.asset));
     (theme.skin?.home?.cards || []).forEach(item => item.icon && paths.add(item.icon));
     return paths;
+  }
+  async function mapConcurrent(items, concurrency, mapper) {
+    const results = new Array(items.length);
+    let next = 0;
+    const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+      while (next < items.length) {
+        const index = next++;
+        results[index] = await mapper(items[index], index);
+      }
+    });
+    await Promise.all(workers);
+    return results;
+  }
+  function visibleAssetPriority(theme) {
+    const priority = [];
+    const add = path => { if (path && !priority.includes(path)) priority.push(path); };
+    (theme.skin?.decorations || []).forEach(item => add(item.asset));
+    add(theme.skin?.resources?.heroBadge);
+    add(theme.skin?.resources?.sticker);
+    add(theme.skin?.resources?.composerDecoration);
+    add(theme.skin?.resources?.logo);
+    add(theme.skin?.resources?.avatar);
+    add(theme.skin?.resources?.heroImage);
+    add(theme.skin?.resources?.sidebarWatermark);
+    return priority;
   }
   function clearAssetRetry() {
     clearTimeout(assetRetryTimer);
@@ -282,16 +317,6 @@
   function generationUrlsComplete(result, urls) {
     const assets = (result?.assets || []).filter(asset => asset?.path);
     return assets.every(asset => isPreviewDataUrl(urls.get(asset.path))) && atlasRestoreComplete(result, urls);
-  }
-  function atlasDraftComplete(item) {
-    const atlas = stagingAssets.find(asset => asset.slot === "skin.icons.atlas" && asset.session === item.session && asset.path === item.path);
-    if (!atlas || !isPreviewDataUrl(stagedUrls.get(atlas.path))) return false;
-    const mappings = draft?.skin?.icons?.mappings || {};
-    return skinIconFields.every(([action]) => {
-      const slot = `skin.icons.${action}`;
-      const asset = stagingAssets.find(candidate => candidate.slot === slot);
-      return asset?.path && mappings[action] === asset.path && isPreviewDataUrl(stagedUrls.get(asset.path));
-    });
   }
   async function loadCompleteGenerationUrls(result, shouldContinue = () => true, attempts = 1) {
     for (let attempt = 0; attempt < attempts; attempt += 1) {
@@ -346,7 +371,8 @@
     const border = surface?.borderColor || fallbackBorder;
     const radius = surface?.radius ?? fallbackRadius;
     const shadow = surface?.shadowColor || "#000000";
-    const opacity = options.maxOpacity == null ? (surface?.opacity ?? 1) : Math.min(surface?.opacity ?? 1, options.maxOpacity);
+    const requestedOpacity = surface?.opacity ?? 1;
+    const opacity = Math.max(options.minOpacity ?? 0, options.maxOpacity == null ? requestedOpacity : Math.min(requestedOpacity, options.maxOpacity));
     let css = surface?.fill || opacity !== 1 ? `background-color:${rgbaFromHex(fill, opacity)}!important;` : "";
     if ((surface?.borderWidth ?? 0) > 0) css += `border:${surface.borderWidth}px solid ${border}!important;`;
     if (options.radius !== false) css += `border-radius:${radius}px!important;`;
@@ -422,6 +448,8 @@
     const heroBase = normalizeColor((skin.enabled && surfaces.hero?.fill) || tokens.elevatedBackground);
     const heroForeground = safeForeground(heroBase, tokens.foreground);
     const heroMuted = safeForeground(heroBase, tokens.mutedForeground, 3.2);
+    const heroUsesLightText = colorLuminance(heroForeground) > .5;
+    const heroProtection = heroUsesLightText ? "3,8,18" : "255,255,255";
     const cardBase = normalizeColor((skin.enabled && surfaces.card?.fill) || tokens.elevatedBackground);
     const cardForeground = safeForeground(cardBase, tokens.foreground);
     const cardMuted = safeForeground(cardBase, tokens.mutedForeground, 3.2);
@@ -458,7 +486,7 @@
   --ti-radius:${shape.radius}px;--ti-border-width:${shape.borderWidth}px;--ti-shadow:0 12px 34px rgba(0,0,0,${shadowAlpha});--ti-app-header-bottom:${headerBottom};--ti-content-header-bottom:${contentHeaderBottom};
   --ti-titlebar-bg:${titlebarBase};--ti-titlebar-fg:${titlebarForeground};--ti-titlebar-muted:${titlebarMuted};--ti-titlebar-border:${titlebarBorder};--ti-titlebar-hover:${titlebarHover};
   --ti-sidebar-fg:${sidebarForeground};--ti-sidebar-muted:${sidebarMuted};--ti-sidebar-icon:${sidebarIcon};--ti-sidebar-border:${sidebarBorder};--ti-sidebar-hover:${sidebarHover};--ti-sidebar-selected:${sidebarSelected};--ti-sidebar-selected-fg:${sidebarSelectedForeground};--ti-skin-sidebar-fill:${surfaces.sidebar?.fill || tokens.sidebarBackground};
-  --ti-content-fg:${contentForeground};--ti-content-muted:${contentMuted};--ti-hero-fg:${heroForeground};--ti-hero-muted:${heroMuted};--ti-card-fg:${cardForeground};--ti-card-muted:${cardMuted};--ti-composer-fg:${composerForeground};--ti-composer-muted:${composerMuted};--ti-popover-fg:${popoverForeground};--ti-popover-muted:${popoverMuted};
+  --ti-content-fg:${contentForeground};--ti-content-muted:${contentMuted};--ti-hero-fg:${heroForeground};--ti-hero-muted:${heroMuted};--ti-hero-protection:rgba(${heroProtection},.88);--ti-hero-protection-soft:rgba(${heroProtection},.58);--ti-card-fg:${cardForeground};--ti-card-muted:${cardMuted};--ti-composer-fg:${composerForeground};--ti-composer-muted:${composerMuted};--ti-popover-fg:${popoverForeground};--ti-popover-muted:${popoverMuted};
   --ti-skin-icon:${skin.icons?.color || sidebarIcon};--ti-skin-icon-active:${skin.icons?.activeColor || tokens.accent};
   --spacing-token-sidebar:${layout.sidebarWidth}px;--thread-content-max-width:${layout.contentMaxWidth}px;--conversation-item-gap:${Math.round(16 * density)}px;
   --token-foreground:${tokens.foreground};--token-text-primary:${tokens.foreground};--token-text-secondary:${tokens.mutedForeground};--token-text-tertiary:${tokens.subtleForeground};
@@ -518,7 +546,12 @@ body>#root,body>[data-reactroot],#__next{position:relative;z-index:1;background:
 [data-theme-inject-custom-icon]{position:relative;}
 [data-theme-inject-custom-icon] svg{display:none!important;}
 [data-theme-inject-custom-icon]::before{content:"";flex:0 0 auto;width:16px;height:16px;background-image:var(--ti-custom-icon);background-size:contain;background-position:center;background-repeat:no-repeat;}
-${skinEnabled && skin.icons?.mode !== "native" ? `.app-shell-left-panel button svg,.app-shell-left-panel [role="button"] svg,[data-codex-composer-root] button svg{color:var(--ti-skin-icon)!important;stroke:currentColor!important;}.app-header-tint button svg,.app-header-tint [role="button"] svg{color:var(--ti-titlebar-muted)!important;stroke:currentColor!important;}.app-header-tint button:hover svg,.app-header-tint [role="button"]:hover svg{color:var(--ti-titlebar-fg)!important;}.app-shell-left-panel [data-app-action-sidebar-thread-active="true"] svg,[aria-pressed="true"] svg{color:var(--ti-skin-icon-active)!important;}` : ""}
+${skinEnabled && skin.icons?.mode !== "native" ? `.app-shell-left-panel button svg,.app-shell-left-panel [role="button"] svg{color:var(--ti-skin-icon)!important;stroke:currentColor!important;}.app-header-tint button svg,.app-header-tint [role="button"] svg{color:var(--ti-titlebar-muted)!important;stroke:currentColor!important;}.app-header-tint button:hover svg,.app-header-tint [role="button"]:hover svg{color:var(--ti-titlebar-fg)!important;}.app-shell-left-panel [data-app-action-sidebar-thread-active="true"] svg,.app-shell-left-panel [aria-pressed="true"] svg{color:var(--ti-skin-icon-active)!important;}` : ""}
+:is([data-codex-composer-submit],[data-app-action-submit],[data-composer-navigation-target="submit"]){background:var(--ti-accent)!important;color:var(--ti-accent-foreground)!important;border-color:var(--ti-accent)!important;}
+:is([data-codex-composer-submit],[data-app-action-submit],[data-composer-navigation-target="submit"]) svg{display:block!important;color:var(--ti-accent-foreground)!important;fill:currentColor!important;stroke:currentColor!important;opacity:1!important;}
+:is([data-codex-composer-submit],[data-app-action-submit],[data-composer-navigation-target="submit"])[data-theme-inject-custom-icon="send"] svg{display:none!important;}
+[data-theme-inject-button-contrast="true"]{color:var(--ti-native-button-fg)!important;}
+[data-theme-inject-button-contrast="true"] svg{color:var(--ti-native-button-fg)!important;fill:currentColor!important;stroke:currentColor!important;opacity:1!important;}
 [data-turn-key],[data-codex-composer-root],.text-size-chat{font-size:${baseFontSize}px;line-height:${type.lineHeight};}
 [data-thread-scroll-footer]{--thread-content-max-width:${layout.contentMaxWidth}px;}
 .composer-surface-chrome,[data-codex-composer-root] .composer-surface-chrome{background-color:var(--ti-input)!important;color:var(--ti-composer-fg)!important;border:var(--ti-border-width) solid var(--ti-border)!important;border-radius:var(--ti-radius)!important;box-shadow:var(--ti-shadow)!important;--token-foreground:var(--ti-composer-fg);--token-text-primary:var(--ti-composer-fg);--token-text-tertiary:var(--ti-composer-muted);${skinEnabled ? surfaceCss(surfaces.composer,tokens.inputBackground,effectiveBorder,shape.radius) : ""}}
@@ -532,7 +565,7 @@ a{color:var(--ti-link);}::selection{background:var(--ti-selection);color:var(--t
 #${BRAND_ID}{font-family:${cssValue(skin.brand?.font,type.uiFont)};}
 #${HOME_ID} .ti-home-hero{color:var(--ti-hero-fg)!important;${skinEnabled ? surfaceCss(surfaces.hero,tokens.elevatedBackground,effectiveBorder,shape.radius) : ""}}
 #${HOME_ID} .ti-home-copy h1{color:var(--ti-hero-fg)!important;}#${HOME_ID} .ti-home-copy p{color:var(--ti-hero-muted)!important;}
-#${HOME_ID} .ti-home-card{color:var(--ti-card-fg)!important;${skinEnabled ? surfaceCss(surfaces.card,tokens.elevatedBackground,effectiveBorder,shape.radius) : ""}}#${HOME_ID} .ti-home-card span{color:var(--ti-card-muted)!important;}
+#${HOME_ID} .ti-home-card{color:var(--ti-card-fg)!important;${skinEnabled ? surfaceCss(surfaces.card,tokens.elevatedBackground,effectiveBorder,shape.radius,{minOpacity:.84}) : ""}}#${HOME_ID} .ti-home-card span{color:var(--ti-card-muted)!important;}
 [data-theme-inject-native-home="hidden"]{visibility:hidden!important;pointer-events:none!important;}
 [data-theme-inject-light-surface="true"]{color:#172033!important;--token-foreground:#172033;--token-text-primary:#172033;--token-text-secondary:#52627a;--token-text-tertiary:#6b7b91;--color-token-foreground:#172033;--color-token-text-primary:#172033;--color-token-text-secondary:#52627a;--color-token-text-tertiary:#6b7b91;--color-token-button-foreground:#172033;--color-token-input-foreground:#172033;--color-token-icon-foreground:#334155;--vscode-foreground:#172033;--vscode-descriptionForeground:#52627a;--vscode-input-foreground:#172033;}
 [data-theme-inject-light-surface="true"] :is(h1,h2,h3,h4,h5,h6,p,span,label,button,[role="button"],[role="switch"],select,input){color:inherit;}
@@ -552,6 +585,7 @@ ${customCss || ""}`;
     patchTitlebar();
     syncSkin(theme);
     syncIcons(theme);
+    syncNativeButtonContrast();
     patchShadowRoots(style.textContent);
     patchDiffRoots(theme);
     patchTerminal(theme);
@@ -613,6 +647,11 @@ ${customCss || ""}`;
       .filter(node => node !== systemTitlebar && node.getBoundingClientRect().top > 1)
       .sort((left, right) => right.getBoundingClientRect().width - left.getBoundingClientRect().width)[0];
     const main = document.querySelector(".main-surface");
+    if (layoutResizeTarget !== main) {
+      layoutResizeObserver.disconnect();
+      layoutResizeTarget = main;
+      if (main) layoutResizeObserver.observe(main);
+    }
     const systemBottom = systemTitlebar ? Math.max(0, Math.round(systemTitlebar.getBoundingClientRect().bottom)) : 36;
     const contentBottom = taskTitlebar ? Math.max(systemBottom, Math.round(taskTitlebar.getBoundingClientRect().bottom)) : systemBottom;
     const mainLeft = main ? Math.max(0, Math.round(main.getBoundingClientRect().left)) : 0;
@@ -647,6 +686,7 @@ ${customCss || ""}`;
     });
     if (!theme.skin?.enabled || theme.skin.icons?.mode !== "custom") return;
     for (const [action, path] of Object.entries(theme.skin.icons.mappings || {})) {
+      if (action === "send") continue;
       const url = resolvedAsset(theme, path);
       if (!url) continue;
       resolveIconNodes(action).forEach(node => {
@@ -709,7 +749,7 @@ ${customCss || ""}`;
     ].filter(Boolean);
     const decorations = [...builtins, ...(theme.skin.decorations || [])];
     const visible = decorations.filter(item => (item.region || "content") !== "titlebar" && (!item.hiddenBelow || window.innerWidth >= item.hiddenBelow) && Boolean(resolvedAsset(theme, item.asset)));
-    const signature = JSON.stringify([visible, [...stagedUrls.keys()]]);
+    const signature = JSON.stringify(visible.map(item => [item, resolvedAsset(theme, item.asset)]));
     if (decorationsSignature === signature && root.childElementCount === visible.length) return;
     decorationsSignature = signature;
     root.replaceChildren();
@@ -796,30 +836,28 @@ ${customCss || ""}`;
     const paths = themeAssetPaths(theme);
     const sameTheme = assetCacheThemeId === theme.id;
     const urls = new Map(sameTheme ? [...assetUrls].filter(([path, url]) => paths.has(path) && isPreviewDataUrl(url)) : []);
-    const failed = [];
-    const retryPaths = options.retryAttempt > 0 && assetRetryThemeId === theme.id
-      ? new Set([...assetRetryPaths].filter(path => paths.has(path)))
-      : null;
-    for (const path of [...paths].filter(path => !stagedUrls.has(path) && (!retryPaths || retryPaths.has(path)))) {
-      let url = "";
-      for (let attempt = 0; attempt < 2 && !url; attempt += 1) {
-        try {
-          const result = await call("theme.background.data", { id: theme.id, path });
-          if (isPreviewDataUrl(result.url)) url = result.url;
-        } catch {
-          if (attempt === 0) await waitFor(80);
-        }
-        if (destroyed || lifecycle !== lifecycleEpoch || epoch !== assetHydrationEpoch) return null;
+    const priority = visibleAssetPriority(theme);
+    const pending = [...paths]
+      .filter(path => !stagedUrls.has(path) && !urls.has(path))
+      .sort((left, right) => {
+        const leftIndex = priority.indexOf(left), rightIndex = priority.indexOf(right);
+        return (leftIndex < 0 ? Number.MAX_SAFE_INTEGER : leftIndex) - (rightIndex < 0 ? Number.MAX_SAFE_INTEGER : rightIndex);
+      });
+    const loaded = await mapConcurrent(pending, 3, async path => {
+      try {
+        const result = await call("theme.background.data", { id: theme.id, path });
+        return isPreviewDataUrl(result.url) ? [path, result.url] : [path, ""];
+      } catch {
+        return [path, ""];
       }
-      if (url) urls.set(path, url); else failed.push(path);
-    }
+    });
     if (destroyed || lifecycle !== lifecycleEpoch || epoch !== assetHydrationEpoch) return null;
+    const failed = [];
+    loaded.forEach(([path, url]) => { if (url) urls.set(path, url); else failed.push(path); });
     assetCacheThemeId = theme.id;
-    assetUrls = new Map([...urls].filter(([path, url]) => paths.has(path) && isPreviewDataUrl(url)));
+    assetUrls = urls;
     assetRetryPaths = new Set(failed);
-    if (failed.length) scheduleAssetRetry(theme, options.retryAttempt || 0);
-    else clearAssetRetry();
-    if (failed.length) setStatus(`有 ${failed.length} 个皮肤资源读取失败，已使用安全回退`, "error");
+    if (failed.length) scheduleAssetRetry(theme, options.retryAttempt || 0); else clearAssetRetry();
     return failed.length === 0;
   }
 
@@ -923,6 +961,52 @@ ${customCss || ""}`;
       if (luminance > .72 && bounds.width > 280 && bounds.height > 44 && style.backgroundColor !== "rgba(0, 0, 0, 0)") node.dataset.themeInjectLightSurface = "true";
     });
   }
+  function generationPlansComplete(result) {
+    const slots = new Set((result?.assets || []).map(asset => asset.slot));
+    return (result?.plans || []).every(plan => slots.has(plan.slot));
+  }
+
+  function syncNativeButtonContrast() {
+    document.querySelectorAll('[data-theme-inject-button-contrast="true"]').forEach(node => node.removeAttribute("data-theme-inject-button-contrast"));
+    document.querySelectorAll("button,[role=button]").forEach(node => {
+      if (node.closest(`#${PANEL_ID},.ti-studio-backdrop`) || node.matches('[data-theme-inject-custom-icon]')) return;
+      const style = getComputedStyle(node);
+      const channels = style.backgroundColor.match(/[\d.]+/g)?.slice(0, 4).map(Number);
+      if (!channels || (channels[3] ?? 1) < .72) return;
+      const background = `#${channels.slice(0, 3).map(value => Math.round(value).toString(16).padStart(2, "0")).join("")}`;
+      const foreground = colorContrast(background, "#000000") >= colorContrast(background, "#FFFFFF") ? "#000000" : "#FFFFFF";
+      node.dataset.themeInjectButtonContrast = "true";
+      node.style.setProperty("--ti-native-button-fg", foreground);
+    });
+  }
+
+  function scheduleDraftPreview() {
+    const now = Date.now();
+    if (!draftPreviewDeadline) draftPreviewDeadline = now + 240;
+    clearTimeout(draftPreviewTimer);
+    const delay = Math.max(0, Math.min(80, draftPreviewDeadline - now));
+    draftPreviewTimer = setTimeout(() => {
+      draftPreviewTimer = 0;
+      draftPreviewDeadline = 0;
+      if (!destroyed && draft) applyTheme(draft, state?.customCssTrusted ? draftCustomCss : "");
+    }, delay);
+  }
+
+  function scheduleStudioPreview(studio) {
+    const now = Date.now();
+    if (!studioPreviewDeadline) studioPreviewDeadline = now + 700;
+    clearTimeout(studioPreviewTimer);
+    const delay = Math.max(0, Math.min(180, studioPreviewDeadline - now));
+    studioPreviewTimer = setTimeout(() => {
+      studioPreviewTimer = 0;
+      studioPreviewDeadline = 0;
+      if (!destroyed && studioOpen && studio?.isConnected) {
+        applyTheme(draft, "");
+        refreshStudioDom(studio, true);
+        renderStudioDecorations(studio);
+      }
+    }, delay);
+  }
 
   function studioHtml() {
     const progressItems = aiGenerationProgress.items || [];
@@ -930,11 +1014,11 @@ ${customCss || ""}`;
     const failedCount = progressItems.filter(item => item.status === "failed").length;
     const activeItems = progressItems.filter(item => item.status === "generating");
     const totalCount = progressItems.length;
-    const progressPercent = totalCount ? Math.round((completedCount + failedCount) / totalCount * 100) : aiGenerationProgress.state === "planning" ? 8 : 0;
+    const progressPercent = totalCount ? Math.round(completedCount / totalCount * 100) : aiGenerationProgress.state === "planning" ? 8 : 0;
     const phase = generationPhase(aiGenerationProgress.state, aiGenerationProgress.message, activeItems, completedCount, totalCount, failedCount);
     const latestActivity = aiRequestLog.at(-1);
     const plans = aiResourcePlans.map((plan, index) => `<div class="ti-resource-item" data-status="configured"><div class="ti-resource-preview"></div><div class="ti-resource-info"><strong>${escapeHtml(resourceSlotLabel(plan.slot))}</strong><span title="${escapeHtml(plan.prompt)}">${escapeHtml(plan.prompt)}</span></div><button class="ti-icon-button" data-studio-remove-plan="${index}">删除</button></div>`).join("");
-    const progress = progressItems.map(item => { const previewUrl = stagedUrls.get(item.path) || item.previewUrl || ""; return `<div class="ti-resource-item" data-status="${escapeHtml(item.status)}"><div class="ti-resource-preview" data-empty="${!previewUrl}" style="${previewUrl ? `background-image:url(&quot;${escapeHtml(previewUrl)}&quot;)` : ""}"></div><div class="ti-resource-info"><strong>${escapeHtml(item.label || resourceSlotLabel(item.slot))}</strong><span title="${escapeHtml(item.message || item.prompt)}">${escapeHtml(item.message || item.prompt)}</span></div><div class="ti-resource-state">${escapeHtml(resourceStatusLabel(item.status))}</div></div>`; }).join("");
+    const progress = progressItems.map(item => { const previewUrl = thumbnailUrls.get(item.path) || item.previewUrl || ""; return `<div class="ti-resource-item" data-status="${escapeHtml(item.status)}"><div class="ti-resource-preview" data-empty="${!previewUrl}" style="${previewUrl ? `background-image:url(&quot;${escapeHtml(previewUrl)}&quot;)` : ""}"></div><div class="ti-resource-info"><strong>${escapeHtml(item.label || resourceSlotLabel(item.slot))}</strong><span title="${escapeHtml(item.message || item.prompt)}">${escapeHtml(item.message || item.prompt)}</span></div><div class="ti-resource-state">${escapeHtml(resourceStatusLabel(item.status))}</div></div>`; }).join("");
     const reference = aiReferences.length ? `<div class="ti-reference-grid">${aiReferences.map((item, index) => `<div class="ti-ai-reference"><div class="ti-ai-reference-image" style="background-image:url(&quot;${escapeHtml(item.previewUrl)}&quot;)"></div><div><strong>${escapeHtml(item.path?.split("/").pop() || `参考图 ${index + 1}`)}</strong><span>参考图 ${index + 1}</span><button class="ti-button" type="button" data-studio-reference-remove="${index}">移除</button></div></div>`).join("")}</div>` : `<div class="ti-studio-empty">可选：添加参考图分析配色、氛围和层级。也可以 Ctrl+V 直接粘贴图片。</div>`;
     const logs = aiRequestLog.length ? aiRequestLog.slice().reverse().map(item => `<div class="ti-ai-log-item" data-outcome="${escapeHtml(item.outcome)}"><div><strong>${escapeHtml(item.stage)}</strong><span>${escapeHtml(item.model)} · ${item.httpStatus || "网络错误"} · ${item.durationMs} ms</span></div><code>${escapeHtml(item.endpoint)}</code>${item.message && item.message !== "请求成功" ? `<p>${escapeHtml(item.message)}</p>` : ""}</div>`).join("") : `<div class="ti-studio-empty">开始生成后，这里会实时显示蓝图和图片请求。</div>`;
     const decorations = draft?.skin?.decorations || [];
@@ -1227,7 +1311,7 @@ ${customCss || ""}`;
     if (render) renderStudio();
   }
 
-  function generationIsActive(epoch) { return !destroyed && epoch === generationEpoch && busy && studioOpen; }
+  function generationIsActive(epoch) { return !destroyed && epoch === generationEpoch && busy; }
 
   async function generateAiTheme(epoch) {
     await saveAiSettings();
@@ -1258,7 +1342,7 @@ ${customCss || ""}`;
     const logs = await call("ai.log.get").catch(() => []);
     if (!generationIsActive(epoch)) return;
     aiRequestLog = logs;
-    const complete = await restoreCompleteGeneration(result, () => generationIsActive(epoch), Number.POSITIVE_INFINITY);
+    const complete = await restoreCompleteGeneration(result, () => generationIsActive(epoch), 3);
     if (!complete || !generationIsActive(epoch)) throw new Error("生成资源尚未完整加载，请稍后重试");
     result = complete.result;
     const nextKeys = new Set((result.assets || []).map(asset => `${asset.session}:${asset.path}`));
@@ -1267,6 +1351,7 @@ ${customCss || ""}`;
     if (!generationIsActive(epoch)) return;
     await clearAiReference(false);
     if (!generationIsActive(epoch)) return;
+    if (!studioOpen) return;
     draft = clone(result.theme);
     draftCustomCss = "";
     state.customCssTrusted = false;
@@ -1275,8 +1360,6 @@ ${customCss || ""}`;
     complete.urls.forEach((url, path) => stagedUrls.set(path, url));
     dirty = true;
     aiGeneratedDraft = true;
-    await hydrateAssets(draft);
-    if (!generationIsActive(epoch)) return;
     applyTheme(draft, "");
   }
 
@@ -1343,63 +1426,22 @@ ${customCss || ""}`;
 
   async function syncProgressAssets(progress, epoch) {
     let changed = false;
-    let restoreAtlas = false;
     for (const item of progress?.items || []) {
-      if (!generationIsActive(epoch)) return { changed: false, restoreAtlas: false };
+      if (!generationIsActive(epoch)) return false;
       if (item.status !== "completed" || !item.path || !item.session) continue;
       if (item.slot === "skin.icons.atlas") {
-        if (!atlasDraftComplete(item)) restoreAtlas = true;
         continue;
       }
       const current = stagingAssets.find(asset => asset.slot === item.slot && asset.session === item.session && asset.path === item.path);
-      if (current && stagedUrls.has(item.path)) { item.previewUrl = stagedUrls.get(item.path); continue; }
+      if (current && thumbnailUrls.has(item.path)) { item.previewUrl = thumbnailUrls.get(item.path); continue; }
       const previewUrl = await previewDataUrl(item);
-      if (!generationIsActive(epoch)) return { changed: false, restoreAtlas: false };
+      if (!generationIsActive(epoch)) return false;
       item.previewUrl = previewUrl;
-      if (previewUrl) stagedUrls.set(item.path, previewUrl);
-      else stagedUrls.delete(item.path);
-      stagingAssets = stagingAssets.filter(asset => asset.slot !== item.slot);
-      stagingAssets.push({ slot: item.slot, session: item.session, path: item.path });
-      applyProgressAsset(item.slot, item.path);
+      if (previewUrl) thumbnailUrls.set(item.path, previewUrl);
+      else thumbnailUrls.delete(item.path);
       changed = true;
     }
-    if (changed) {
-      dirty = true;
-      aiGeneratedDraft = true;
-      applyTheme(draft, "");
-    }
-    return { changed, restoreAtlas };
-  }
-
-  function applyProgressAsset(slot, path) {
-    if (slot === "background.fullscreen") {
-      draft.background.mode = "fullscreen";
-      draft.background.fullscreen = { ...defaultBackground("image", "fullscreen"), path, blur: 0, surfaceOpacity: .3 };
-    } else if (slot === "background.content") {
-      draft.background.mode = "per-region";
-      draft.background.content = { ...defaultBackground("image", "content"), path, blur: 0, surfaceOpacity: .34 };
-    } else if (slot === "background.sidebar") {
-      draft.background.mode = "per-region";
-      draft.background.sidebar = { ...defaultBackground("image", "sidebar"), path, blur: 0, surfaceOpacity: .44 };
-    } else if (slot === "skin.logo") draft.skin.resources.logo = path;
-    else if (slot === "skin.sidebarWatermark") draft.skin.resources.sidebarWatermark = path;
-    else if (slot === "skin.heroImage") draft.skin.resources.heroImage = path;
-    else if (slot === "skin.heroBadge") draft.skin.resources.heroBadge = path;
-    else if (slot === "skin.avatar") draft.skin.resources.avatar = path;
-    else if (slot === "skin.sticker") draft.skin.resources.sticker = path;
-    else if (slot === "skin.composerDecoration") draft.skin.resources.composerDecoration = path;
-    else if (slot.startsWith("skin.icons.") && slot !== "skin.icons.atlas") {
-      const action = slot.slice("skin.icons.".length);
-      draft.skin.icons.mode = "custom";
-      draft.skin.icons.mappings[action] = path;
-    } else if (slot.startsWith("skin.home.cards.") && slot.endsWith(".icon")) {
-      const index = Number(slot.slice("skin.home.cards.".length, -".icon".length));
-      if (draft.skin.home.cards[index]) draft.skin.home.cards[index].icon = path;
-    } else if (slot.startsWith("skin.decorations.") && slot.endsWith(".asset")) {
-      const index = Number(slot.slice("skin.decorations.".length, -".asset".length));
-      while (draft.skin.decorations.length <= index) draft.skin.decorations.push({ asset: "", region: "content", anchor: "bottom-right", offsetX: 24, offsetY: 24, width: 180, opacity: 1, layer: 0, hiddenBelow: 0 });
-      draft.skin.decorations[index].asset = path;
-    }
+    return changed;
   }
 
   async function restoreGeneratedTheme() {
@@ -1431,7 +1473,7 @@ ${customCss || ""}`;
         message: result.summary || "已恢复上次生成结果",
         items: (result.plans || []).map(plan => ({ slot: plan.slot, label: resourceSlotLabel(plan.slot), prompt: plan.prompt, status: restoredAssets.has(plan.slot) ? "completed" : "queued", previewUrl: restoredAssets.get(plan.slot)?.previewUrl || "", session: restoredAssets.get(plan.slot)?.session || "", path: restoredAssets.get(plan.slot)?.path || "", message: "" })),
       };
-      aiGeneratedDraft = true;
+      aiGeneratedDraft = generationPlansComplete(result);
       dirty = true;
       statusMessage = result.summary || "已恢复上次生成结果";
       statusKind = "success";
@@ -1467,6 +1509,7 @@ ${customCss || ""}`;
       stagedUrls.clear();
       aiGeneratedDraft = false;
       studioSaveOpen = false;
+      studioBaseline = null;
       dirty = false;
       statusMessage = `已保存为新主题“${result.theme.name}”`;
       statusKind = "success";
@@ -1482,21 +1525,40 @@ ${customCss || ""}`;
 
   function openStudio() {
     if (destroyed) return;
+    if (!studioOpen) {
+      studioBaseline = {
+        draft: clone(draft),
+        customCss: draftCustomCss,
+        stagingAssets: clone(stagingAssets),
+        dirty,
+        customCssTrusted: Boolean(state.customCssTrusted),
+      };
+    }
     studioOpen = true;
     const panel = document.getElementById(PANEL_ID);
     if (panel) panel.dataset.open = "false";
     renderStudio(true);
+    if (busy) void pollGenerationProgress(generationEpoch);
   }
 
   function closeStudio() {
-    if (busy) return;
     studioOpen = false;
-    generationEpoch += 1;
     clearTimeout(studioTimer);
     document.querySelector(".ti-studio-backdrop")?.remove();
+    if (studioBaseline) {
+      draft = clone(studioBaseline.draft);
+      draftCustomCss = studioBaseline.customCss;
+      stagingAssets = clone(studioBaseline.stagingAssets);
+      dirty = studioBaseline.dirty;
+      state.customCssTrusted = studioBaseline.customCssTrusted;
+      studioBaseline = null;
+      aiGeneratedDraft = false;
+      studioSaveOpen = false;
+      stagedUrls.clear();
+      void hydrateAssets(draft).then(() => applyTheme(draft, state.customCssTrusted ? draftCustomCss : ""));
+    }
     const panel = document.getElementById(PANEL_ID);
     if (panel) panel.dataset.open = "true";
-    applyTheme(draft, state.customCssTrusted ? draftCustomCss : "");
     renderPanel();
   }
 
@@ -1509,6 +1571,11 @@ ${customCss || ""}`;
     const root = document.createElement("div");
     root.innerHTML = studioHtml();
     const studio = root.firstElementChild;
+    const closeButton = studio.querySelector("[data-studio-close]");
+    if (closeButton) { closeButton.disabled = false; closeButton.removeAttribute("title"); closeButton.textContent = busy ? "关闭（后台继续）" : "关闭"; }
+    const generateButton = studio.querySelector("[data-studio-generate]");
+    const failedCount = (aiGenerationProgress.items || []).filter(item => item.status === "failed").length;
+    if (generateButton && !busy && failedCount) generateButton.textContent = `继续生成 ${failedCount} 个缺失素材`;
     const prompt = studio.querySelector("[data-studio-prompt]");
     if (prompt && !studio.querySelector("[data-studio-language]")) prompt.insertAdjacentHTML("beforebegin", `<label class="ti-field-label">界面语言</label><select class="ti-control" data-studio-language ${busy ? "disabled" : ""}>${themeLanguageOptions.map(([value, label]) => `<option value="${value}" ${aiLanguage === value ? "selected" : ""}>${label}</option>`).join("")}</select>`);
     const generateImagesCopy = studio.querySelector("[data-studio-generate-images]")?.nextElementSibling;
@@ -1644,16 +1711,17 @@ ${customCss || ""}`;
         renderStudio();
       });
     });
-    studio.querySelectorAll("[data-color-path]").forEach(input => input.addEventListener("input", () => { setPath(draft, input.dataset.colorPath, input.value.toUpperCase()); markStudioDirty(); refreshStudioDom(studio, true); }));
+    studio.querySelectorAll("[data-color-path]").forEach(input => input.addEventListener("input", () => { setPath(draft, input.dataset.colorPath, input.value.toUpperCase()); markStudioDirty(); scheduleStudioPreview(studio); }));
     studio.querySelectorAll("[data-color-text]").forEach(input => input.addEventListener("change", () => { if (/^#[0-9a-f]{6}$/i.test(input.value.trim())) { setPath(draft, input.dataset.colorText, input.value.trim().toUpperCase()); markStudioDirty(); refreshStudioDom(studio, true); } }));
-    studio.querySelectorAll("[data-path]").forEach(input => input.addEventListener("input", () => { setPath(draft, input.dataset.path, Number(input.value)); markStudioDirty(); refreshStudioDom(studio, true); }));
+    studio.querySelectorAll("[data-path]").forEach(input => input.addEventListener("input", () => { setPath(draft, input.dataset.path, Number(input.value)); markStudioDirty(); scheduleStudioPreview(studio); }));
     studio.querySelectorAll("[data-studio-select-decoration]").forEach(button => button.addEventListener("click", () => { studioSelectedDecoration = Number(button.dataset.studioSelectDecoration); renderStudio(); }));
     studio.querySelectorAll("[data-studio-decoration-path]").forEach(input => input.addEventListener(input.tagName === "SELECT" ? "change" : "input", () => {
       const decoration = draft.skin.decorations[studioSelectedDecoration];
       if (!decoration) return;
       decoration[input.dataset.studioDecorationPath] = input.tagName === "SELECT" ? input.value : Number(input.value);
       markStudioDirty();
-      renderStudio();
+      renderStudioDecorations(studio);
+      scheduleStudioPreview(studio);
     }));
     studio.querySelectorAll(".ti-studio-decoration").forEach(image => image.addEventListener("pointerdown", beginDecorationDrag));
   }
@@ -1701,49 +1769,14 @@ ${customCss || ""}`;
     if (!generationIsActive(epoch)) return;
     aiGenerationProgress = progress;
     aiRequestLog = logs;
-    if (progress.state === "generating" && !aiGeneratedDraft) {
-      await syncCheckpointDraft(epoch);
-      if (!generationIsActive(epoch)) return;
-    }
-    const { changed, restoreAtlas } = await syncProgressAssets(progress, epoch);
+    const changed = await syncProgressAssets(progress, epoch);
     if (!generationIsActive(epoch)) return;
-    if (restoreAtlas) {
-      await syncCheckpointDraft(epoch, true);
-      if (!generationIsActive(epoch)) return;
+    const signature = JSON.stringify([progress.state, progress.message, (progress.items || []).map(item => [item.slot, item.status, item.path, item.message]), aiRequestLog.length]);
+    if (studioOpen && (changed || signature !== studioProgressSignature)) {
+      studioProgressSignature = signature;
+      renderStudio(false);
     }
-    renderStudio(changed || restoreAtlas);
-    if (generationIsActive(epoch)) studioTimer = setTimeout(() => void pollGenerationProgress(epoch), 500);
-  }
-
-  async function syncCheckpointDraft(epoch, force = false) {
-    try {
-      const restored = await restoreCompleteGeneration(null, () => generationIsActive(epoch), force ? 3 : 1);
-      if (!restored || !generationIsActive(epoch)) return false;
-      const { result, urls } = restored;
-      draft = clone(result.theme);
-      draftCustomCss = "";
-      state.customCssTrusted = false;
-      aiResourcePlans = (result.plans || []).filter(plan => resourceSlotOptions.some(([slot]) => slot === plan.slot));
-      const restoredAssets = new Map((result.assets || []).map(asset => [asset.slot, asset]));
-      stagingAssets = (result.assets || []).map(asset => ({ slot: asset.slot, session: asset.session, path: asset.path }));
-      stagedUrls.clear();
-      urls.forEach((url, path) => stagedUrls.set(path, url));
-      aiGeneratedDraft = true;
-      dirty = true;
-      await hydrateAssets(draft);
-      if (!generationIsActive(epoch)) return false;
-      applyTheme(draft, "");
-      if (!progressHasItems(aiGenerationProgress) || force) {
-        aiGenerationProgress.items = (result.plans || []).map(plan => ({ slot: plan.slot, label: resourceSlotLabel(plan.slot), prompt: plan.prompt, status: restoredAssets.has(plan.slot) ? "completed" : "queued", previewUrl: restoredAssets.get(plan.slot)?.previewUrl || "", session: restoredAssets.get(plan.slot)?.session || "", path: restoredAssets.get(plan.slot)?.path || "", message: "" }));
-      }
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  function progressHasItems(progress) {
-    return Array.isArray(progress?.items) && progress.items.length > 0;
+    if (generationIsActive(epoch) && studioOpen) studioTimer = setTimeout(() => void pollGenerationProgress(epoch), 500);
   }
 
   async function chooseStudioReference() {
@@ -1807,7 +1840,7 @@ ${customCss || ""}`;
 
   async function replaceStagedAsset(slot, result) {
     const previous = stagingAssets.find(asset => asset.slot === slot);
-    if (previous) { try { await call("theme.preview.cancel", { session: previous.session }); } catch {} stagedUrls.delete(previous.path); }
+    if (previous) { try { await call("theme.preview.cancel", { session: previous.session }); } catch {} stagedUrls.delete(previous.path); thumbnailUrls.delete(previous.path); }
     stagingAssets = stagingAssets.filter(asset => asset.slot !== slot);
     stagingAssets.push({ slot, session: result.stagingSession, path: result.path });
     stagedUrls.set(result.path, result.previewUrl || "");
@@ -1816,21 +1849,22 @@ ${customCss || ""}`;
   function setStatus(message, kind = "") { if (destroyed) return; statusMessage = message; statusKind = kind; const node = document.querySelector(`#${PANEL_ID} .ti-status`); if (node) { node.dataset.kind = kind; node.replaceChildren(message); } }
   function setBusy(value) { busy = value; const panel = document.getElementById(PANEL_ID); if (!panel) return; panel.dataset.busy = String(value); panel.setAttribute("aria-busy", String(value)); panel.querySelectorAll("button,input,select,textarea").forEach(control => control.disabled = value); }
   async function runAction(message, action, success) { if (busy) return; setBusy(true); setStatus(message); try { await action(); statusMessage = success; statusKind = "success"; } catch (error) { statusMessage = error?.message || "操作失败"; statusKind = "error"; } finally { setBusy(false); const panel = document.getElementById(PANEL_ID); if (panel?.dataset.open === "true") renderPanel(); } }
-  function markDirty() { dirty = true; statusMessage = ""; statusKind = ""; applyTheme(draft, state.customCssTrusted ? draftCustomCss : ""); document.querySelector(".ti-status")?.replaceChildren("有未应用修改"); }
+  function markDirty() { dirty = true; statusMessage = ""; statusKind = ""; scheduleDraftPreview(); document.querySelector(".ti-status")?.replaceChildren("有未应用修改"); }
   async function applyDraft() { draft.skin.decorations = (draft.skin.decorations || []).filter(item => item.asset); const referenced = collectAssetPaths(draft); const unused = stagingAssets.filter(asset => !referenced.has(asset.path)); await cancelPreviewSessions(unused); stagingAssets = stagingAssets.filter(asset => referenced.has(asset.path)); const result = await call("theme.apply", { theme: draft, customCss: draftCustomCss, enableCustomCss: Boolean(state.customCssTrusted), stagingAssets: stagingAssets.map(({ session, path }) => ({ session, path })) }); stagingAssets = []; stagedUrls.clear(); await clearAiReference(false); state = result.state; draft = clone(result.theme); snapshot = clone(result.theme); draftCustomCss = state.customCss || ""; dirty = false; await hydrateAssets(draft); applyTheme(draft, state.customCssTrusted ? draftCustomCss : ""); renderPanel(); }
   function collectAssetPaths(theme) { const paths = new Set(); [theme.background?.fullscreen, theme.background?.content, theme.background?.sidebar].forEach(background => { if (background?.kind === "image" && background.path) paths.add(background.path); }); Object.values(theme.skin?.resources || {}).forEach(path => typeof path === "string" && path && paths.add(path)); Object.values(theme.skin?.icons?.mappings || {}).forEach(path => path && paths.add(path)); (theme.skin?.decorations || []).forEach(item => item.asset && paths.add(item.asset)); (theme.skin?.home?.cards || []).forEach(item => item.icon && paths.add(item.icon)); return paths; }
-  async function cancelStaging() { const pending = stagingAssets; const references = aiReferences; stagingAssets = []; aiReferences = []; stagedUrls.clear(); await cancelPreviewSessions([...pending, ...references]); }
+  async function cancelStaging() { const pending = stagingAssets; const references = aiReferences; stagingAssets = []; aiReferences = []; stagedUrls.clear(); thumbnailUrls.clear(); await cancelPreviewSessions([...pending, ...references]); }
   function cancelPreview() { void cancelStaging().then(async () => { draft = clone(snapshot); draftCustomCss = state?.customCss || ""; dirty = false; if (snapshot) { await hydrateAssets(snapshot); applyTheme(snapshot, state?.customCssTrusted ? state.customCss || "" : ""); } renderPanel(); }); }
   function closePanel() { if (dirty) { modal = { kind: "close" }; renderPanel(); return; } void cancelStaging().then(hidePanel); }
   function hidePanel() { aiApiKeyDraft = ""; aiImageApiKeyDraft = ""; const panel = document.getElementById(PANEL_ID); if (panel) panel.dataset.open = "false"; }
   async function reloadThemes() { state.themes = await call("theme.package.list"); }
   async function reloadState() { const lifecycle = lifecycleEpoch; await cancelStaging(); if (destroyed || lifecycle !== lifecycleEpoch) return; state = await call("theme.state.get"); if (destroyed || lifecycle !== lifecycleEpoch) return; aiSettings = clone(state.ai); draft = clone(state.activeTheme); snapshot = clone(state.activeTheme); draftCustomCss = state.customCss || ""; dirty = false; await hydrateAssets(draft); if (destroyed || lifecycle !== lifecycleEpoch) return; applyTheme(draft, state.customCssTrusted ? draftCustomCss : ""); }
   async function openPanel() { if (destroyed) return; const lifecycle = lifecycleEpoch; if (!state) await reloadState(); if (destroyed || lifecycle !== lifecycleEpoch || !state) return; draft = clone(state.activeTheme); snapshot = clone(state.activeTheme); draftCustomCss = state.customCss || ""; dirty = false; renderPanel(); }
-  function ensureTrigger() { if (destroyed || document.getElementById(TRIGGER_ID) || !document.body) return; ensurePanelStyles(); const button = document.createElement("button"); button.id = TRIGGER_ID; button.type = "button"; button.textContent = "主题"; button.addEventListener("click", () => void openPanel()); document.body.appendChild(button); }
-  function scheduleRefresh() { if (destroyed) return; clearTimeout(mutationTimer); if (draft) syncHome(draft); mutationTimer = setTimeout(() => { if (destroyed) return; ensureTrigger(); if (draft) { patchTitlebar(); mountBackgrounds(draft); syncSkin(draft); syncIcons(draft); syncNativeSurfaceContrast(); patchDiffRoots(draft); patchTerminal(draft); } }, 60); }
-  function destroy() { if (destroyed) return; destroyed = true; lifecycleEpoch += 1; generationEpoch += 1; assetHydrationEpoch += 1; busy = false; studioOpen = false; studioSaveOpen = false; modal = null; activeDecorationDragCleanup?.(); activeDecorationDragCleanup = null; clearAssetRetry(); observer.disconnect(); window.removeEventListener("resize", scheduleRefresh); clearTimeout(mutationTimer); clearTimeout(studioTimer); mutationTimer = 0; studioTimer = 0; Object.values(BACKDROP_IDS).forEach(id => document.getElementById(id)?.remove()); document.getElementById(BRAND_ID)?.remove(); document.getElementById(HOME_ID)?.remove(); document.getElementById(DECORATIONS_ID)?.remove(); document.getElementById(PANEL_ID)?.remove(); document.getElementById(TRIGGER_ID)?.remove(); document.getElementById(PANEL_STYLE_ID)?.remove(); document.querySelector(".ti-studio-backdrop")?.remove(); document.querySelectorAll("[data-theme-inject-custom-icon]").forEach(node => { delete node.dataset.themeInjectCustomIcon; node.style.removeProperty("--ti-custom-icon"); }); const attachShadow = Element.prototype.attachShadow; if (attachShadow.__themeInjectOriginal) Element.prototype.attachShadow = attachShadow.__themeInjectOriginal; callbacks.forEach(callback => { clearTimeout(callback.timer); callback.reject(new Error("Theme Inject reloaded")); }); callbacks.clear(); }
+  function ensureTrigger() { if (destroyed) return; ensurePanelStyles(); if (document.getElementById(TRIGGER_ID) || !document.body) return; const button = document.createElement("button"); button.id = TRIGGER_ID; button.type = "button"; button.textContent = "主题"; button.addEventListener("click", () => void openPanel()); document.body.appendChild(button); }
+  function scheduleRefresh() { if (destroyed) return; clearTimeout(mutationTimer); if (draft) syncHome(draft); mutationTimer = setTimeout(() => { if (destroyed) return; ensureTrigger(); if (draft) { patchTitlebar(); mountBackgrounds(draft); syncSkin(draft); syncIcons(draft); syncNativeSurfaceContrast(); syncNativeButtonContrast(); patchDiffRoots(draft); patchTerminal(draft); } }, 60); }
+  function destroy() { if (destroyed) return; destroyed = true; lifecycleEpoch += 1; generationEpoch += 1; assetHydrationEpoch += 1; busy = false; studioOpen = false; studioSaveOpen = false; modal = null; activeDecorationDragCleanup?.(); activeDecorationDragCleanup = null; layoutResizeObserver.disconnect(); layoutResizeTarget = null; clearAssetRetry(); observer.disconnect(); window.removeEventListener("resize", scheduleRefresh); clearTimeout(mutationTimer); clearTimeout(studioTimer); mutationTimer = 0; studioTimer = 0; Object.values(BACKDROP_IDS).forEach(id => document.getElementById(id)?.remove()); document.getElementById(BRAND_ID)?.remove(); document.getElementById(HOME_ID)?.remove(); document.getElementById(DECORATIONS_ID)?.remove(); document.getElementById(PANEL_ID)?.remove(); document.getElementById(TRIGGER_ID)?.remove(); document.getElementById(PANEL_STYLE_ID)?.remove(); document.querySelector(".ti-studio-backdrop")?.remove(); document.querySelectorAll("[data-theme-inject-custom-icon]").forEach(node => { delete node.dataset.themeInjectCustomIcon; node.style.removeProperty("--ti-custom-icon"); }); const attachShadow = Element.prototype.attachShadow; if (attachShadow.__themeInjectOriginal) Element.prototype.attachShadow = attachShadow.__themeInjectOriginal; callbacks.forEach(callback => { clearTimeout(callback.timer); callback.reject(new Error("Theme Inject reloaded")); }); callbacks.clear(); }
 
   installAttachShadowHook();
+  const layoutResizeObserver = new ResizeObserver(scheduleRefresh);
   const observer = new MutationObserver(scheduleRefresh);
   observer.observe(document.documentElement, { childList: true, subtree: true });
   window.addEventListener("resize", scheduleRefresh);

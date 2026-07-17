@@ -351,7 +351,9 @@ fn request_timeout(method: &str) -> Duration {
         | "theme.asset.import"
         | "ai.reference.import"
         | "ai.reference.upload" => FILE_REQUEST_TIMEOUT,
-        "theme.background.data" | "theme.preview.data" => DATA_URL_REQUEST_TIMEOUT,
+        "theme.background.data" | "theme.preview.data" | "theme.preview.thumbnail" => {
+            DATA_URL_REQUEST_TIMEOUT
+        }
         _ => DEFAULT_REQUEST_TIMEOUT,
     }
 }
@@ -395,6 +397,7 @@ fn valid_method(method: &str) -> bool {
             | "theme.background.import"
             | "theme.background.data"
             | "theme.preview.data"
+            | "theme.preview.thumbnail"
             | "theme.asset.import"
             | "theme.preview.cancel"
             | "theme.activate"
@@ -423,6 +426,7 @@ mod tests {
         assert!(valid_method("ai.generation.save"));
         assert!(valid_method("ai.reference.upload"));
         assert!(valid_method("theme.preview.data"));
+        assert!(valid_method("theme.preview.thumbnail"));
         assert!(!valid_method("filesystem.delete"));
     }
 
@@ -455,6 +459,10 @@ mod tests {
     fn data_url_requests_have_extended_timeout() {
         assert_eq!(
             request_timeout("theme.preview.data"),
+            DATA_URL_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            request_timeout("theme.preview.thumbnail"),
             DATA_URL_REQUEST_TIMEOUT
         );
         assert_eq!(

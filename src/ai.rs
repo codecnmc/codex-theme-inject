@@ -7,7 +7,9 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use base64::Engine;
 use futures_util::{StreamExt, stream};
-use image::{DynamicImage, ImageFormat, RgbaImage, imageops::FilterType};
+use image::{
+    DynamicImage, ImageFormat, RgbaImage, codecs::jpeg::JpegEncoder, imageops::FilterType,
+};
 use reqwest::header::{CONTENT_TYPE, RETRY_AFTER};
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
@@ -916,35 +918,56 @@ impl AiThemeService {
                 if generated_bytes > MAX_GENERATED_TOTAL_BYTES {
                     bail!("AI 生成资源总大小超过 72 MB");
                 }
-                let staged = if slot == GeneratedSlot::ActionIconAtlas {
-                    let (atlas, icons) = self.stage_action_icon_atlas(&bytes)?;
-                    for (action_slot, generated) in &icons {
-                        apply_generated_slot(&mut theme, *action_slot, &generated.path)?;
+                let processed = (|| -> anyhow::Result<Option<GeneratedAsset>> {
+                    if slot == GeneratedSlot::ActionIconAtlas {
+                        let (atlas, icons) = self.stage_action_icon_atlas(&bytes)?;
+                        for (action_slot, generated) in &icons {
+                            apply_generated_slot(&mut theme, *action_slot, &generated.path)?;
+                        }
+                        self.update_generation_item(
+                            slot,
+                            "completed",
+                            &atlas.preview_url,
+                            &atlas.session,
+                            &atlas.path,
+                            "已切割为 9 个系统图标",
+                        );
+                        generated_assets.push(atlas);
+                        generated_assets.extend(icons.into_iter().map(|(_, asset)| asset));
+                        Ok(None)
+                    } else {
+                        let bytes = post_process_generated_asset(slot, &bytes)?;
+                        let staged = self.stage_generated_asset(slot, &bytes)?;
+                        apply_generated_slot(&mut theme, slot, &staged.path)?;
+                        self.update_generation_item(
+                            slot,
+                            "completed",
+                            &staged.preview_url,
+                            &staged.session,
+                            &staged.path,
+                            "",
+                        );
+                        Ok(Some(staged))
                     }
-                    self.update_generation_item(
-                        slot,
-                        "completed",
-                        &atlas.preview_url,
-                        &atlas.session,
-                        &atlas.path,
-                        "已切割为 9 个系统图标",
-                    );
-                    generated_assets.push(atlas);
-                    generated_assets.extend(icons.into_iter().map(|(_, asset)| asset));
-                    None
-                } else {
-                    let bytes = post_process_generated_asset(slot, &bytes)?;
-                    let staged = self.stage_generated_asset(slot, &bytes)?;
-                    apply_generated_slot(&mut theme, slot, &staged.path)?;
-                    self.update_generation_item(
-                        slot,
-                        "completed",
-                        &staged.preview_url,
-                        &staged.session,
-                        &staged.path,
-                        "",
-                    );
-                    Some(staged)
+                })();
+                let staged = match processed {
+                    Ok(staged) => staged,
+                    Err(error) => {
+                        self.update_generation_item(
+                            slot,
+                            "failed",
+                            "",
+                            "",
+                            "",
+                            &format!("{error:#}"),
+                        );
+                        if first_error.is_none() {
+                            first_error =
+                                Some(error.context(format!("{}处理失败", slot.stage_label())));
+                        }
+                        self.save_checkpoint(&fingerprint, &theme, &plans, &generated_assets)?;
+                        continue;
+                    }
                 };
                 if let Some(staged) = staged {
                     generated_assets.push(staged);
@@ -952,9 +975,24 @@ impl AiThemeService {
                 self.save_checkpoint(&fingerprint, &theme, &plans, &generated_assets)?;
             }
             if let Some(error) = first_error {
+                let completed_plans = plans
+                    .iter()
+                    .filter(|(slot, _)| {
+                        generated_assets
+                            .iter()
+                            .any(|asset| asset.slot == slot.asset_slot())
+                    })
+                    .count();
+                self.set_generation_state(
+                    "failed",
+                    &format!(
+                        "已完成 {completed_plans}/{} 个图片资源，可使用相同需求继续生成缺失素材",
+                        plans.len()
+                    ),
+                );
                 return Err(error.context(format!(
                     "已持久化保存 {}/{} 个图片资源；再次使用相同描述生成时将从未完成处继续",
-                    generated_assets.len(),
+                    completed_plans,
                     plans.len()
                 )));
             }
@@ -986,12 +1024,12 @@ impl AiThemeService {
         };
         let input = if references.is_empty() {
             json!(format!(
-                "用户要求：{prompt}\n界面语言：{}。所有面向用户的主题名称、品牌文案、首页标题、说明和卡片文字必须使用该语言。",
+                "用户原始要求（最高优先级，不得弱化、替换风格或擅自改题）：{prompt}\n界面语言：{}。先逐项提取用户指定的主题、主体、颜色、材质、氛围、构图、装饰和禁用项，再让 palette、skin、home、background 及每个 assets.prompt 明确落实这些约束。所有面向用户的主题名称、品牌文案、首页标题、说明和卡片文字必须使用该语言。",
                 theme_language_name(language)
             ))
         } else {
             let mut content = vec![
-                json!({ "type": "input_text", "text": format!("用户要求：{prompt}\n界面语言：{}。请综合分析所有参考图的色彩、层级、氛围、布局和共同风格，生成可读且实用的 Codex 皮肤蓝图。所有面向用户的主题名称、品牌文案、首页标题、说明和卡片文字必须使用该语言。", theme_language_name(language)) }),
+                json!({ "type": "input_text", "text": format!("用户原始要求（最高优先级，不得弱化、替换风格或擅自改题）：{prompt}\n界面语言：{}。逐张分析参考图，并明确提取共同的主色、辅助色、材质、主体、构图重心、留白、装饰密度和光影；palette、background、skin 和每个 assets.prompt 必须可追溯地采用这些特征，而不是只生成泛化的同类风格。如果参考图与文字冲突，以用户文字为准；如果不冲突，两者都必须落实。所有面向用户的主题名称、品牌文案、首页标题、说明和卡片文字必须使用该语言。", theme_language_name(language)) }),
             ];
             content.extend(references.iter().map(|reference| {
                 json!({ "type": "input_image", "image_url": reference, "detail": "high" })
@@ -1360,7 +1398,8 @@ impl AiThemeService {
         &self,
         bytes: &[u8],
     ) -> anyhow::Result<(GeneratedAsset, Vec<(GeneratedSlot, GeneratedAsset)>)> {
-        let atlas = self.stage_generated_asset(GeneratedSlot::ActionIconAtlas, bytes)?;
+        let atlas_bytes = resize_and_encode_png(bytes, 1024, 1024)?;
+        let atlas = self.stage_generated_asset(GeneratedSlot::ActionIconAtlas, &atlas_bytes)?;
         let mut icons = Vec::with_capacity(ICON_ACTIONS.len());
         let result = (|| -> anyhow::Result<()> {
             let image = image::load_from_memory(bytes)
@@ -1628,12 +1667,17 @@ fn standard_gpt_image_dimensions(ratio: &str) -> &'static str {
 }
 
 fn post_process_generated_asset(slot: GeneratedSlot, bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let image = image::load_from_memory(bytes).context("无法解码待优化的生成资源")?;
     if !slot.requires_transparency() {
-        return Ok(bytes.to_vec());
+        let (max_width, max_height) = match slot {
+            GeneratedSlot::BackgroundFullscreen | GeneratedSlot::BackgroundContent => (1600, 1600),
+            GeneratedSlot::BackgroundSidebar => (640, 1280),
+            GeneratedSlot::HeroImage => (1200, 600),
+            _ => (1200, 1200),
+        };
+        return encode_jpeg(&resize_within(image, max_width, max_height), 84);
     }
-    let image = image::load_from_memory(bytes)
-        .context("无法解码待抠图的生成资源")?
-        .to_rgba8();
+    let image = image.to_rgba8();
     let (width, height) = match slot {
         GeneratedSlot::Logo => (768, 384),
         GeneratedSlot::SidebarWatermark => (384, 768),
@@ -1641,6 +1685,34 @@ fn post_process_generated_asset(slot: GeneratedSlot, bytes: &[u8]) -> anyhow::Re
         _ => (512, 512),
     };
     encode_png(&normalize_transparent_asset(image, width, height)?)
+}
+
+fn resize_within(image: DynamicImage, max_width: u32, max_height: u32) -> DynamicImage {
+    if image.width() <= max_width && image.height() <= max_height {
+        image
+    } else {
+        image.resize(max_width, max_height, FilterType::Lanczos3)
+    }
+}
+
+fn resize_and_encode_png(bytes: &[u8], max_width: u32, max_height: u32) -> anyhow::Result<Vec<u8>> {
+    let image = image::load_from_memory(bytes).context("无法解码待优化的 PNG 资源")?;
+    let image = resize_within(image, max_width, max_height).to_rgba8();
+    encode_png(&image)
+}
+
+fn encode_jpeg(image: &DynamicImage, quality: u8) -> anyhow::Result<Vec<u8>> {
+    let rgb = image.to_rgb8();
+    let mut output = Vec::new();
+    JpegEncoder::new_with_quality(&mut output, quality)
+        .encode(
+            &rgb,
+            rgb.width(),
+            rgb.height(),
+            image::ExtendedColorType::Rgb8,
+        )
+        .context("无法编码优化后的 JPEG")?;
+    Ok(output)
 }
 
 fn normalize_transparent_asset(
@@ -1788,7 +1860,7 @@ fn icon_generation_plans(blueprint: &ThemeBlueprint) -> Vec<(GeneratedSlot, Stri
         "Create one centered standalone icon from a cohesive desktop IDE icon set. \
          Theme: {}. Style direction: {}. Use {} as the main icon color with {} accents. \
          Use a flat pure green chroma key background (#00FF00) with no shadows touching the edge. \
-         Never use transparent-looking checkerboard, white, gray, or a framed square background. Simple recognizable silhouette, consistent stroke weight, generous padding, no border frame.",
+         Never use transparent-looking checkerboard, white, gray, or a framed square background. The icon subject itself must not be black or near-black and must maintain at least 4.5:1 contrast against the theme's input and accent surfaces. No solid circular or square button plate. Simple recognizable silhouette, consistent stroke weight, generous padding, no border frame.",
         blueprint.name.trim(),
         style,
         palette.foreground,
@@ -1820,7 +1892,7 @@ fn action_icon_atlas_prompt(blueprint: &ThemeBlueprint) -> String {
          Use exactly nine equal cells in row-major order: {meanings}. Theme: {}. Style: {}. \
          Every cell contains one centered icon with identical scale, stroke weight and generous padding. \
          The entire canvas and every gap must be solid pure chroma green #00FF00. \
-         No text, labels, dividers, frames, shadows, gradients, checkerboard or extra objects.",
+         Render the icon subjects in a bright high-contrast color derived from the theme foreground/accent; never use black or near-black subjects and never draw circular or square button plates. No text, labels, dividers, frames, shadows, gradients, checkerboard or extra objects.",
         blueprint.name.trim(),
         if blueprint.icon_style.trim().is_empty() {
             "clean geometric product iconography"
@@ -2354,7 +2426,7 @@ fn image_request_body(
     };
     let mut body = json!({
         "model": credentials.image_model,
-        "prompt": format!("Create a polished visual asset for a desktop coding application theme. Target canvas dimensions: {target_dimensions} pixels. Keep the composition at a {aspect_ratio} aspect ratio. Background and UI ambience assets must be crisp and inspectable, not blurred or foggy; use clear shapes, readable contrast, and low haze. Do not design or cover the app title bar, native task header, send button, settings controls, or window controls. No readable text, no UI screenshot, no watermark. User art direction: {prompt}. Mandatory output constraint: {background_direction}"),
+        "prompt": format!("Create a polished visual asset for a desktop coding application theme. The supplied user art direction is mandatory: preserve every named subject, palette, material, mood, composition, decoration, and negative constraint; do not replace it with a generic interpretation. Target canvas dimensions: {target_dimensions} pixels. Keep the composition at a {aspect_ratio} aspect ratio. Background and UI ambience assets must be crisp and inspectable, not blurred or foggy; use clear shapes, readable contrast, and low haze. Do not design or cover the app title bar, native task header, send button, settings controls, or window controls. No readable text, no UI screenshot, no watermark. Mandatory user art direction: {prompt}. Mandatory output constraint: {background_direction}"),
         "n": 1,
         "size": target_dimensions
     });
@@ -2622,8 +2694,9 @@ Schema:
   "assets":[{"slot":"allowed slot","prompt":"English visual prompt, no text or watermark"}]
 }
 Allowed image slots: background.fullscreen, background.content, background.sidebar, skin.logo, skin.heroImage, skin.heroBadge, skin.avatar, skin.sticker, skin.composerDecoration. Do not include skin.sidebarWatermark unless the user explicitly asks for a watermark; the application owns that opt-in.
-Use strict valid JSON syntax with double-quoted property names and strings. Every palette value must be exactly seven ASCII characters in #RRGGBB form; never emit shorthand, named colors, rgb(), alpha, #RRGGBBAA, transparent, or gradients in palette fields. Use the language explicitly requested by the user for every user-facing name, description, brand string, home title, subtitle, and card string. Use at most 4 cards and at most 6 assets. Prefer skin.heroImage plus only assets that materially improve the requested design. Never design, describe, or restyle the operating-system title bar, Codex task header, window controls, settings controls, send button, permission controls, or other native interaction chrome; those remain native and must stay clearly recognizable. System action icons and sidebar watermarks are controlled by explicit application options; never add them to assets automatically. Background images must be clear, crisp, and recognizable, not heavily blurred ambience; prefer blur 0-4 and surfaceOpacity 0.25-0.44 so the image remains visible while text surfaces stay readable.
-Treat readability as a hard constraint, not an aesthetic suggestion. Calculate WCAG 2 relative-luminance contrast before returning JSON: palette.foreground must be at least 4.5:1 against app, sidebar, content, elevated, and input; muted must be at least 3:1 against all five surfaces; accentForeground must be at least 4.5:1 against accent; codeForeground must be at least 7:1 against codeBackground. Title-bar labels, the Codex task-header title and controls, sidebar labels, terminal text, editor text, and code-review text must never use the same or a near-identical color as their background. Code-review additions, deletions, unchanged rows, inline highlights, and selected rows must retain at least 4.5:1 text contrast and avoid competing saturated red/green fills. Borders, icons, focus indicators, and essential controls should reach 3:1 against adjacent surfaces. Verify both default and hover/active states, and keep native light settings cards readable even when the requested theme is dark. Do not imitate a living artist, include copyrighted logos, or request readable text inside generated images."##
+Treat the user's original wording as a binding specification. Before composing JSON, internally enumerate every explicit requested theme, subject, color, material, mood, layout, decoration, and prohibition. Preserve those requirements in the palette and structure, and repeat the relevant concrete visual constraints inside every assets.prompt. When references are supplied, derive their actual dominant/supporting colors, material language, composition, focal placement, whitespace, decoration density, and lighting; do not substitute a generic genre-adjacent design. User text wins only where it conflicts with a reference; otherwise satisfy both.
+Use strict valid JSON syntax with double-quoted property names and strings. Every palette value must be exactly seven ASCII characters in #RRGGBB form; never emit shorthand, named colors, rgb(), alpha, #RRGGBBAA, transparent, or gradients in palette fields. Use the language explicitly requested by the user for every user-facing name, description, brand string, home title, subtitle, and card string. Use at most 4 cards and at most 6 assets. Prefer skin.heroImage plus only assets that materially improve the requested design. Never design, describe, or restyle the operating-system title bar, Codex task header, window controls, settings controls, send button, permission controls, or other native interaction chrome; those remain native and must stay clearly recognizable. System action icons and sidebar watermarks are controlled by explicit application options; never add them to assets automatically. Background and Hero images must be clear, crisp, and recognizable, not heavily blurred ambience; keep the lower-left text area relatively calm and low-detail, and prefer blur 0-4 and surfaceOpacity 0.25-0.44 so imagery remains visible while protected text surfaces stay readable.
+Treat readability as a hard constraint, not an aesthetic suggestion. Calculate WCAG 2 relative-luminance contrast before returning JSON: palette.foreground must be at least 4.5:1 against app, sidebar, content, elevated, and input; muted must be at least 3:1 against all five surfaces; accentForeground must be at least 4.5:1 against accent; codeForeground must be at least 7:1 against codeBackground. The accent/accentForeground pair is used by primary controls including the send button, so its icon must remain unmistakable in default, hover, active, and disabled states. Title-bar labels, the Codex task-header title and controls, sidebar labels, terminal text, editor text, and code-review text must never use the same or a near-identical color as their background. Code-review additions, deletions, unchanged rows, inline highlights, and selected rows must retain at least 4.5:1 text contrast and avoid competing saturated red/green fills. Borders, icons, focus indicators, and essential controls should reach 3:1 against adjacent surfaces. Verify both default and hover/active states, and keep native light settings cards readable even when the requested theme is dark. Do not imitate a living artist, include copyrighted logos, or request readable text inside generated images."##
 }
 
 fn solid_background(color: &str, surface_opacity: f32) -> RegionBackground {
@@ -3422,7 +3495,12 @@ mod tests {
                 let response = if attempt < 2 {
                     json!({ "error": { "message": if attempt == 0 { "group requests-per-minute limit exceeded" } else { "temporary upstream failure" } } })
                 } else {
-                    let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+                    let png = encode_png(&RgbaImage::from_pixel(
+                        64,
+                        32,
+                        image::Rgba([30, 120, 180, 255]),
+                    ))
+                    .unwrap();
                     json!({ "data": [{ "b64_json": base64::engine::general_purpose::STANDARD.encode(png) }] })
                 };
                 let body = serde_json::to_vec(&response).unwrap();
@@ -3586,6 +3664,32 @@ mod tests {
                 .unwrap()
                 .color()
                 .has_alpha()
+        );
+    }
+
+    #[test]
+    fn opaque_generated_assets_are_resized_and_compressed() {
+        let source = DynamicImage::ImageRgb8(image::RgbImage::from_fn(1774, 887, |x, y| {
+            image::Rgb([(x % 251) as u8, (y % 241) as u8, ((x + y) % 239) as u8])
+        }));
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        source.write_to(&mut encoded, ImageFormat::Png).unwrap();
+
+        let hero =
+            post_process_generated_asset(GeneratedSlot::HeroImage, encoded.get_ref()).unwrap();
+        assert!(hero.starts_with(&[0xFF, 0xD8, 0xFF]));
+        assert_eq!(
+            image::load_from_memory(&hero).unwrap().dimensions(),
+            (1200, 600)
+        );
+
+        let background =
+            post_process_generated_asset(GeneratedSlot::BackgroundFullscreen, encoded.get_ref())
+                .unwrap();
+        assert!(background.starts_with(&[0xFF, 0xD8, 0xFF]));
+        assert_eq!(
+            image::load_from_memory(&background).unwrap().dimensions(),
+            (1600, 800)
         );
     }
 
@@ -3971,7 +4075,12 @@ mod tests {
                             .to_ascii_lowercase()
                             .contains("authorization: bearer sk-image")
                     );
-                    let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+                    let png = encode_png(&RgbaImage::from_pixel(
+                        64,
+                        32,
+                        image::Rgba([30, 120, 180, 255]),
+                    ))
+                    .unwrap();
                     json!({ "data": [{ "b64_json": base64::engine::general_purpose::STANDARD.encode(png) }] })
                 };
                 let body = serde_json::to_vec(&response).unwrap();

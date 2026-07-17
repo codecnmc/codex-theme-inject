@@ -5,6 +5,7 @@ use std::path::Path;
 
 use anyhow::{Context, bail};
 use base64::Engine;
+use image::{DynamicImage, ImageFormat, imageops::FilterType};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
@@ -197,6 +198,44 @@ impl ThemePackageManager {
         };
         let encoded = base64::engine::general_purpose::STANDARD.encode(fs::read(path)?);
         Ok(format!("data:{mime};base64,{encoded}"))
+    }
+
+    pub fn staging_thumbnail_data_url(
+        &self,
+        session: &str,
+        relative: &str,
+    ) -> anyhow::Result<String> {
+        validate_staging_session(session)?;
+        crate::theme::validate_relative_asset_path(relative)?;
+        let root = self.store.paths.staging.canonicalize()?;
+        let path = self
+            .store
+            .paths
+            .staging
+            .join(session)
+            .join(relative)
+            .canonicalize()
+            .context("预览图片不存在")?;
+        if !path.starts_with(&root)
+            || !path.is_file()
+            || fs::metadata(&path)?.len() > MAX_FILE_BYTES
+        {
+            bail!("预览图片无效或超过 15 MB");
+        }
+        let image = image::open(&path).context("无法解码预览图片")?;
+        let thumbnail = if image.width() > 256 || image.height() > 256 {
+            image.resize(256, 256, FilterType::Triangle)
+        } else {
+            image
+        };
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(thumbnail.to_rgba8())
+            .write_to(&mut bytes, ImageFormat::Png)
+            .context("无法编码预览缩略图")?;
+        Ok(format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes.into_inner())
+        ))
     }
 
     pub fn promote_image(
@@ -538,6 +577,30 @@ mod tests {
         assert!(allowed_file(Path::new("theme.json")));
         assert!(allowed_file(Path::new("assets/bg.png")));
         assert!(!allowed_file(Path::new("assets/run.exe")));
+    }
+
+    #[test]
+    fn staging_thumbnail_is_small_and_preserves_transparency() {
+        let (_temp, store) = theme_store();
+        let manager = ThemePackageManager::new(store.clone());
+        let mut source = image::RgbaImage::new(1200, 600);
+        for pixel in source.pixels_mut().take(300 * 300) {
+            *pixel = image::Rgba([240, 80, 120, 255]);
+        }
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(source)
+            .write_to(&mut encoded, ImageFormat::Png)
+            .unwrap();
+        let (session, path) = manager
+            .stage_image_bytes("thumbnail-test", "png", encoded.get_ref())
+            .unwrap();
+        let data_url = manager.staging_thumbnail_data_url(&session, &path).unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data_url.split_once(',').unwrap().1)
+            .unwrap();
+        let thumbnail = image::load_from_memory(&bytes).unwrap();
+        assert!(thumbnail.width() <= 256 && thumbnail.height() <= 256);
+        assert!(thumbnail.color().has_alpha());
     }
 
     #[test]
