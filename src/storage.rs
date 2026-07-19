@@ -17,6 +17,7 @@ pub struct AppPaths {
     pub staging: PathBuf,
     pub logs: PathBuf,
     pub trust: PathBuf,
+    pub trigger_icon: PathBuf,
 }
 
 impl AppPaths {
@@ -37,6 +38,7 @@ impl AppPaths {
             staging: root.join("staging"),
             logs: root.join("logs"),
             trust: root.join("trust.json"),
+            trigger_icon: root.join("trigger-icon.png"),
             root,
         }
     }
@@ -55,6 +57,75 @@ pub struct AppSettings {
     pub active_theme_id: String,
     #[serde(default)]
     pub last_codex_version: String,
+    #[serde(default)]
+    pub trigger_appearance: TriggerAppearance,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerAppearance {
+    #[serde(default = "default_trigger_shape")]
+    pub shape: String,
+    #[serde(default = "default_trigger_size")]
+    pub size: u16,
+    #[serde(default = "default_trigger_offset")]
+    pub right: u16,
+    #[serde(default = "default_trigger_offset")]
+    pub bottom: u16,
+    #[serde(default = "default_trigger_opacity")]
+    pub background_opacity: f32,
+    #[serde(default = "default_trigger_shadow")]
+    pub shadow_strength: f32,
+}
+
+impl Default for TriggerAppearance {
+    fn default() -> Self {
+        Self {
+            shape: default_trigger_shape(),
+            size: default_trigger_size(),
+            right: default_trigger_offset(),
+            bottom: default_trigger_offset(),
+            background_opacity: default_trigger_opacity(),
+            shadow_strength: default_trigger_shadow(),
+        }
+    }
+}
+
+impl TriggerAppearance {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !matches!(self.shape.as_str(), "rounded" | "circle" | "square") {
+            bail!("入口形状无效");
+        }
+        if !(32..=72).contains(&self.size)
+            || self.right > 160
+            || self.bottom > 160
+            || !(0.35..=1.0).contains(&self.background_opacity)
+            || !(0.0..=1.0).contains(&self.shadow_strength)
+        {
+            bail!("入口外观参数超出允许范围");
+        }
+        Ok(())
+    }
+}
+
+fn default_trigger_shape() -> String {
+    "rounded".into()
+}
+
+fn default_trigger_size() -> u16 {
+    40
+}
+
+fn default_trigger_offset() -> u16 {
+    18
+}
+
+fn default_trigger_opacity() -> f32 {
+    0.88
+}
+
+fn default_trigger_shadow() -> f32 {
+    0.35
 }
 
 impl Default for AppSettings {
@@ -62,6 +133,7 @@ impl Default for AppSettings {
         Self {
             active_theme_id: "builtin.neutral-dark".to_string(),
             last_codex_version: String::new(),
+            trigger_appearance: TriggerAppearance::default(),
         }
     }
 }
@@ -85,6 +157,7 @@ impl SettingsStore {
     }
 
     pub fn save(&self, settings: &AppSettings) -> anyhow::Result<()> {
+        settings.trigger_appearance.validate()?;
         atomic_write(&self.path, &serde_json::to_vec_pretty(settings)?)
     }
 }
@@ -101,17 +174,21 @@ impl ThemeStore {
 
     pub fn ensure_builtins(&self) -> anyhow::Result<()> {
         self.paths.ensure()?;
-        for theme in [
+        for mut theme in [
             ThemeManifest::neutral_dark(),
             ThemeManifest::neutral_light(),
             ThemeManifest::midnight_glass(),
         ] {
             let directory = self.paths.themes.join(&theme.id);
             fs::create_dir_all(&directory)?;
-            atomic_write(
-                &directory.join("theme.json"),
-                &serde_json::to_vec_pretty(&theme)?,
-            )?;
+            let manifest = directory.join("theme.json");
+            if manifest.exists()
+                && let Ok(existing) = ThemeManifest::from_slice_migrated(&fs::read(&manifest)?)
+            {
+                theme.name = existing.name;
+                theme.description = existing.description;
+            }
+            atomic_write(&manifest, &serde_json::to_vec_pretty(&theme)?)?;
         }
         Ok(())
     }
@@ -293,6 +370,26 @@ mod tests {
             settings.load().unwrap().active_theme_id,
             "builtin.neutral-dark"
         );
+        assert_eq!(
+            settings.load().unwrap().trigger_appearance,
+            TriggerAppearance::default()
+        );
+    }
+
+    #[test]
+    fn preserves_builtin_theme_metadata_on_refresh() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_root(temp.path().join("ThemeInject"));
+        let themes = ThemeStore::new(paths);
+        themes.ensure_builtins().unwrap();
+        let mut theme = themes.load("builtin.neutral-dark").unwrap();
+        theme.name = "我的深色主题".into();
+        theme.description = "保留自定义介绍".into();
+        themes.save(&theme).unwrap();
+        themes.ensure_builtins().unwrap();
+        let refreshed = themes.load("builtin.neutral-dark").unwrap();
+        assert_eq!(refreshed.name, "我的深色主题");
+        assert_eq!(refreshed.description, "保留自定义介绍");
     }
 
     #[test]

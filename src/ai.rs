@@ -11,7 +11,10 @@ use image::{
     DynamicImage, ImageFormat, RgbaImage, codecs::jpeg::JpegEncoder, imageops::FilterType,
 };
 use reqwest::header::{CONTENT_TYPE, RETRY_AFTER};
-use reqwest::{Client, StatusCode, Url};
+use reqwest::{
+    Client, StatusCode, Url,
+    multipart::{Form, Part},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -29,7 +32,9 @@ const MAX_IMAGE_RESPONSE_BYTES: usize = 22 * 1024 * 1024;
 const MAX_IMAGE_BYTES: usize = 15 * 1024 * 1024;
 const MAX_GENERATED_ASSETS: usize = 6;
 const MAX_GENERATED_TOTAL_BYTES: usize = 72 * 1024 * 1024;
-const IMAGE_GENERATION_CONCURRENCY: usize = 2;
+const MAX_GENERATED_SIDEBAR_WIDTH: u16 = 360;
+const IMAGE_GENERATION_CONCURRENCY: usize = 4;
+const MAX_IMAGE_GENERATION_CONCURRENCY: usize = 4;
 const MAX_AI_REQUEST_CONCURRENCY: usize = 5;
 const MAX_IMAGE_RATE_LIMIT_RETRIES: usize = 8;
 const ICON_ACTIONS: [(&str, &str); 9] = [
@@ -258,10 +263,14 @@ impl AiCredentials {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerateRequest {
     pub prompt: String,
+    #[serde(default)]
+    pub theme_name: String,
+    #[serde(default)]
+    pub theme_description: String,
     #[serde(default = "default_theme_language")]
     pub language: String,
     #[serde(default)]
@@ -296,6 +305,23 @@ pub struct ResourcePlan {
     pub prompt: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerateResourceRequest {
+    pub theme: ThemeManifest,
+    pub slot: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub references: Vec<ReferenceImage>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerateResourceResult {
+    pub theme: ThemeManifest,
+    pub asset: GeneratedAsset,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GeneratedAsset {
@@ -309,6 +335,12 @@ pub struct GeneratedAsset {
 #[serde(rename_all = "camelCase")]
 struct GenerationCheckpoint {
     fingerprint: String,
+    #[serde(default)]
+    prompt: String,
+    #[serde(default)]
+    theme_name: String,
+    #[serde(default)]
+    theme_description: String,
     theme: ThemeManifest,
     plans: Vec<CheckpointPlan>,
     assets: Vec<GeneratedAsset>,
@@ -319,6 +351,8 @@ struct GenerationCheckpoint {
 struct CheckpointPlan {
     slot: String,
     prompt: String,
+    #[serde(default)]
+    reference_indexes: Vec<usize>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -336,6 +370,9 @@ pub struct RestoreResult {
     pub assets: Vec<GeneratedAsset>,
     pub plans: Vec<ResourcePlan>,
     pub summary: String,
+    pub prompt: String,
+    pub theme_name: String,
+    pub theme_description: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -494,6 +531,8 @@ enum BlueprintBackground {
 struct BlueprintAsset {
     slot: String,
     prompt: String,
+    #[serde(default)]
+    reference_indexes: Vec<usize>,
 }
 
 pub struct AiThemeService {
@@ -546,12 +585,16 @@ impl AiThemeService {
         if let Ok(mut progress) = self.generation_progress.lock() {
             progress.state = state.into();
             progress.message = message.into();
+            if state == "planning" {
+                progress.items.clear();
+            }
         }
     }
 
     fn set_generation_plans(
         &self,
         plans: &[(GeneratedSlot, String)],
+        reference_assignments: &BTreeMap<String, Vec<usize>>,
         completed: &[GeneratedAsset],
     ) {
         let completed = completed
@@ -567,7 +610,7 @@ impl AiThemeService {
                     let slot_id = slot.asset_slot();
                     let asset = completed.get(slot_id.as_str()).copied();
                     GenerationProgressItem {
-                        slot: slot_id,
+                        slot: slot_id.clone(),
                         label: slot.stage_label(),
                         prompt: prompt.clone(),
                         status: if asset.is_none() {
@@ -582,6 +625,10 @@ impl AiThemeService {
                         session: asset.map(|asset| asset.session.clone()).unwrap_or_default(),
                         path: asset.map(|asset| asset.path.clone()).unwrap_or_default(),
                         message: String::new(),
+                        reference_indexes: reference_assignments
+                            .get(&slot_id)
+                            .cloned()
+                            .unwrap_or_default(),
                     }
                 })
                 .collect();
@@ -633,6 +680,9 @@ impl AiThemeService {
         let mut checkpoint = self
             .read_checkpoint()?
             .context("没有可恢复的 AI 生成结果")?;
+        if checkpoint.prompt.trim().is_empty() {
+            bail!("旧版生成记录缺少原始提示词，无法确认图片来源，请重新生成主题");
+        }
         checkpoint
             .theme
             .validate()
@@ -668,7 +718,31 @@ impl AiThemeService {
             theme: checkpoint.theme,
             assets: checkpoint.assets,
             plans,
+            prompt: checkpoint.prompt,
+            theme_name: checkpoint.theme_name,
+            theme_description: checkpoint.theme_description,
         })
+    }
+
+    pub fn restore_checkpoint_matching(
+        &self,
+        mut request: GenerateRequest,
+    ) -> anyhow::Result<RestoreResult> {
+        let references = self.reference_data_urls(&request)?;
+        if request.prompt.trim().is_empty() && !references.is_empty() {
+            request.prompt =
+                "请以参考图组为视觉方向，生成一套完整、可读、适合长时间编码的 Codex 皮肤主题"
+                    .into();
+        }
+        let credentials = self.settings.credentials()?;
+        let expected = generation_fingerprint(&request, &references, &credentials);
+        let checkpoint = self
+            .read_checkpoint()?
+            .context("没有可恢复的 AI 生成结果")?;
+        if checkpoint.fingerprint != expected {
+            bail!("上次生成与当前提示词、参考图或生成选项不一致，请重新生成");
+        }
+        self.restore_checkpoint()
     }
 
     pub fn checkpoint_has_session(&self, session: &str) -> bool {
@@ -723,18 +797,27 @@ impl AiThemeService {
     fn save_checkpoint(
         &self,
         fingerprint: &str,
+        request: &GenerateRequest,
         theme: &ThemeManifest,
         plans: &[(GeneratedSlot, String)],
+        reference_assignments: &BTreeMap<String, Vec<usize>>,
         assets: &[GeneratedAsset],
     ) -> anyhow::Result<()> {
         let checkpoint = GenerationCheckpoint {
             fingerprint: fingerprint.into(),
+            prompt: request.prompt.trim().into(),
+            theme_name: request.theme_name.trim().into(),
+            theme_description: request.theme_description.trim().into(),
             theme: theme.clone(),
             plans: plans
                 .iter()
                 .map(|(slot, prompt)| CheckpointPlan {
                     slot: slot.asset_slot(),
                     prompt: prompt.clone(),
+                    reference_indexes: reference_assignments
+                        .get(&slot.asset_slot())
+                        .cloned()
+                        .unwrap_or_default(),
                 })
                 .collect(),
             assets: assets.to_vec(),
@@ -804,24 +887,45 @@ impl AiThemeService {
                     .into();
         }
         validate_prompt(&request.prompt)?;
+        validate_requested_metadata(&request)?;
         validate_theme_language(&request.language)?;
-        request.image_concurrency = request.image_concurrency.clamp(1, 4);
+        request.image_concurrency = request
+            .image_concurrency
+            .clamp(1, MAX_IMAGE_GENERATION_CONCURRENCY);
+        crate::diagnostic::log(
+            "ai.generation.started",
+            json!({
+                "generateImages": request.generate_images,
+                "referenceCount": references.len(),
+                "imageConcurrency": request.image_concurrency,
+                "resourcePlanCount": request.resource_plans.len(),
+            }),
+        );
         validate_resource_plans(&request.resource_plans)?;
         let credentials = self.settings.credentials()?;
         if request.generate_images && credentials.image_api_key.is_none() {
             bail!("尚未保存生图 API Key");
         }
         let fingerprint = generation_fingerprint(&request, &references, &credentials);
+        let effective_prompt = prompt_with_requested_metadata(&request);
         let resumed = request
             .generate_images
             .then(|| self.load_checkpoint(&fingerprint))
             .transpose()?
             .flatten();
-        let (mut theme, plans, mut generated_assets) = if let Some(checkpoint) = resumed {
+        let (mut theme, plans, reference_assignments, mut generated_assets) = if let Some(
+            checkpoint,
+        ) = resumed
+        {
             crate::diagnostic::log(
                 "ai.generation.resumed",
                 json!({ "themeId": checkpoint.theme.id, "completed": checkpoint.assets.len(), "total": checkpoint.plans.len() }),
             );
+            let reference_assignments = checkpoint
+                .plans
+                .iter()
+                .map(|plan| (plan.slot.clone(), plan.reference_indexes.clone()))
+                .collect::<BTreeMap<_, _>>();
             (
                 checkpoint.theme,
                 checkpoint
@@ -831,29 +935,52 @@ impl AiThemeService {
                         GeneratedSlot::from_asset_slot(&plan.slot).map(|slot| (slot, plan.prompt))
                     })
                     .collect::<Vec<_>>(),
+                reference_assignments,
                 checkpoint.assets,
             )
         } else {
             let blueprint = self
                 .generate_blueprint(
                     &credentials,
-                    request.prompt.trim(),
+                    &effective_prompt,
                     request.language.trim(),
                     &references,
                 )
                 .await
                 .context("主题蓝图生成失败")?;
-            let theme = theme_from_blueprint(&blueprint)?;
+            let mut theme = theme_from_blueprint(&blueprint)?;
+            apply_requested_metadata(&mut theme, &request)?;
+            let mut reference_assignments = BTreeMap::new();
             let mut plans = blueprint
                 .assets
                 .iter()
                 .take(MAX_GENERATED_ASSETS)
                 .filter_map(|asset| {
-                    GeneratedSlot::parse(&asset.slot).map(|slot| (slot, asset.prompt.clone()))
+                    GeneratedSlot::parse(&asset.slot).map(|slot| {
+                        let slot_id = slot.asset_slot();
+                        reference_assignments.insert(
+                            slot_id,
+                            normalize_reference_indexes(&asset.reference_indexes, references.len()),
+                        );
+                        (slot, asset.prompt.clone())
+                    })
                 })
                 .collect::<Vec<_>>();
-            plans.extend(icon_generation_plans(&blueprint));
+            let icon_plans = icon_generation_plans(&blueprint);
+            for (slot, _) in &icon_plans {
+                reference_assignments
+                    .entry(slot.asset_slot())
+                    .or_insert_with(|| default_reference_indexes(references.len()));
+            }
+            plans.extend(icon_plans);
             merge_resource_plans(&mut plans, &request.resource_plans);
+            for plan in &request.resource_plans {
+                if let Some(slot) = GeneratedSlot::from_asset_slot(&plan.slot) {
+                    reference_assignments
+                        .entry(slot.asset_slot())
+                        .or_insert_with(|| default_reference_indexes(references.len()));
+                }
+            }
             if request.generate_sidebar_watermark
                 && !plans
                     .iter()
@@ -863,22 +990,52 @@ impl AiThemeService {
                     GeneratedSlot::SidebarWatermark,
                     sidebar_watermark_prompt(&blueprint),
                 ));
+                reference_assignments
+                    .entry(GeneratedSlot::SidebarWatermark.asset_slot())
+                    .or_insert_with(|| default_reference_indexes(references.len()));
             } else if !request.generate_sidebar_watermark {
                 plans.retain(|(slot, _)| *slot != GeneratedSlot::SidebarWatermark);
+                reference_assignments.remove(&GeneratedSlot::SidebarWatermark.asset_slot());
             }
             if request.generate_system_icons {
                 plans.push((
                     GeneratedSlot::ActionIconAtlas,
                     action_icon_atlas_prompt(&blueprint),
                 ));
+                reference_assignments
+                    .entry(GeneratedSlot::ActionIconAtlas.asset_slot())
+                    .or_insert_with(|| default_reference_indexes(references.len()));
+            }
+            if plans.is_empty() {
+                plans.extend(fallback_resource_plans(&blueprint));
+                for (slot, _) in &plans {
+                    reference_assignments
+                        .entry(slot.asset_slot())
+                        .or_insert_with(|| default_reference_indexes(references.len()));
+                }
+            }
+            for (slot, _) in &plans {
+                reference_assignments
+                    .entry(slot.asset_slot())
+                    .or_insert_with(|| default_reference_indexes(references.len()));
+            }
+            for (_, asset_prompt) in &mut plans {
+                *asset_prompt = bind_user_art_direction(asset_prompt, &effective_prompt);
             }
             if request.generate_images {
-                self.save_checkpoint(&fingerprint, &theme, &plans, &[])?;
+                self.save_checkpoint(
+                    &fingerprint,
+                    &request,
+                    &theme,
+                    &plans,
+                    &reference_assignments,
+                    &[],
+                )?;
             }
-            (theme, plans, Vec::new())
+            (theme, plans, reference_assignments, Vec::new())
         };
         if request.generate_images {
-            self.set_generation_plans(&plans, &generated_assets);
+            self.set_generation_plans(&plans, &reference_assignments, &generated_assets);
             let completed = generated_assets
                 .iter()
                 .map(|asset| asset.slot.as_str())
@@ -886,21 +1043,42 @@ impl AiThemeService {
             let pending = plans
                 .iter()
                 .filter(|(slot, _)| !completed.contains(slot.asset_slot().as_str()))
-                .cloned()
+                .map(|(slot, prompt)| {
+                    (
+                        *slot,
+                        prompt.clone(),
+                        selected_reference_urls(
+                            &references,
+                            reference_assignments
+                                .get(&slot.asset_slot())
+                                .map(Vec::as_slice)
+                                .unwrap_or(&[]),
+                        ),
+                    )
+                })
                 .collect::<Vec<_>>();
             let credentials = &credentials;
-            let mut results = stream::iter(pending.into_iter().map(|(slot, prompt)| async move {
-                let stage = slot.stage_label();
-                self.update_generation_item(slot, "generating", "", "", "", "");
-                let result = self
-                    .generate_image(credentials, slot, &prompt, &stage)
-                    .await
-                    .with_context(|| format!("{stage}生成失败"));
-                if let Err(error) = &result {
-                    self.update_generation_item(slot, "failed", "", "", "", &format!("{error:#}"));
-                }
-                (slot, result)
-            }))
+            let mut results = stream::iter(pending.into_iter().map(
+                |(slot, prompt, reference_urls)| async move {
+                    let stage = slot.stage_label();
+                    self.update_generation_item(slot, "generating", "", "", "", "");
+                    let result = self
+                        .generate_image(credentials, slot, &prompt, &reference_urls, &stage)
+                        .await
+                        .with_context(|| format!("{stage}生成失败"));
+                    if let Err(error) = &result {
+                        self.update_generation_item(
+                            slot,
+                            "failed",
+                            "",
+                            "",
+                            "",
+                            &format!("{error:#}"),
+                        );
+                    }
+                    (slot, result)
+                },
+            ))
             .buffer_unordered(request.image_concurrency);
             let mut generated_bytes = self.generated_asset_bytes(&generated_assets)?;
             let mut first_error = None;
@@ -965,14 +1143,28 @@ impl AiThemeService {
                             first_error =
                                 Some(error.context(format!("{}处理失败", slot.stage_label())));
                         }
-                        self.save_checkpoint(&fingerprint, &theme, &plans, &generated_assets)?;
+                        self.save_checkpoint(
+                            &fingerprint,
+                            &request,
+                            &theme,
+                            &plans,
+                            &reference_assignments,
+                            &generated_assets,
+                        )?;
                         continue;
                     }
                 };
                 if let Some(staged) = staged {
                     generated_assets.push(staged);
                 }
-                self.save_checkpoint(&fingerprint, &theme, &plans, &generated_assets)?;
+                self.save_checkpoint(
+                    &fingerprint,
+                    &request,
+                    &theme,
+                    &plans,
+                    &reference_assignments,
+                    &generated_assets,
+                )?;
             }
             if let Some(error) = first_error {
                 let completed_plans = plans
@@ -1007,6 +1199,46 @@ impl AiThemeService {
             ),
             theme,
             assets: generated_assets,
+        })
+    }
+
+    pub async fn generate_resource(
+        &self,
+        mut request: GenerateResourceRequest,
+    ) -> anyhow::Result<GenerateResourceResult> {
+        request.theme.validate()?;
+        let slot = GeneratedSlot::from_asset_slot(request.slot.trim()).context("不支持的资源槽")?;
+        if matches!(
+            slot,
+            GeneratedSlot::ActionIconAtlas
+                | GeneratedSlot::ActionIcon(_)
+                | GeneratedSlot::HomeCardIcon(_)
+        ) {
+            bail!("该资源槽不能单独生成");
+        }
+        let prompt = request.prompt.trim();
+        if prompt.is_empty() || prompt.chars().count() > MAX_PROMPT_CHARS + 2_500 {
+            bail!("资源提示词为空或过长");
+        }
+        let credentials = self.settings.credentials()?;
+        if credentials.image_api_key.is_none() {
+            bail!("尚未保存生图 API Key");
+        }
+        let reference_urls = self.reference_data_urls_from(request.references)?;
+        let stage = format!("重新生成{}", slot.stage_label());
+        let bytes = self
+            .generate_image(&credentials, slot, prompt, &reference_urls, &stage)
+            .await?;
+        let bytes = post_process_generated_asset(slot, &bytes)?;
+        let asset = self.stage_generated_asset(slot, &bytes)?;
+        if let Err(error) = apply_generated_slot(&mut request.theme, slot, &asset.path) {
+            self.cleanup_generated_assets(std::slice::from_ref(&asset));
+            return Err(error);
+        }
+        request.theme.validate()?;
+        Ok(GenerateResourceResult {
+            theme: request.theme,
+            asset,
         })
     }
 
@@ -1066,12 +1298,20 @@ impl AiThemeService {
         credentials: &AiCredentials,
         slot: GeneratedSlot,
         prompt: &str,
+        reference_urls: &[String],
         stage: &str,
     ) -> anyhow::Result<Vec<u8>> {
         if prompt.trim().is_empty() || prompt.chars().count() > 2_000 {
             bail!("生图提示词为空或过长");
         }
-        let endpoint = endpoint(credentials.effective_image_base_url(), EndpointKind::Images)?;
+        let endpoint = endpoint(
+            credentials.effective_image_base_url(),
+            if reference_urls.is_empty() {
+                EndpointKind::Images
+            } else {
+                EndpointKind::ImageEdits
+            },
+        )?;
         let image_api_key = credentials
             .image_api_key
             .as_deref()
@@ -1087,8 +1327,8 @@ impl AiThemeService {
             } else {
                 stage.into()
             };
-            match self
-                .send_json(
+            let response = if reference_urls.is_empty() {
+                self.send_json(
                     &endpoint,
                     image_api_key,
                     &body,
@@ -1097,7 +1337,19 @@ impl AiThemeService {
                     &credentials.image_model,
                 )
                 .await
-            {
+            } else {
+                self.send_image_edit(
+                    &endpoint,
+                    image_api_key,
+                    &body,
+                    reference_urls,
+                    MAX_IMAGE_RESPONSE_BYTES,
+                    &request_stage,
+                    &credentials.image_model,
+                )
+                .await
+            };
+            match response {
                 Ok(value) => break value,
                 Err(error) if error.retry_without_json_mode && !compatibility_retry => {
                     body.as_object_mut().unwrap().remove("response_format");
@@ -1296,6 +1548,131 @@ impl AiThemeService {
         Ok(value)
     }
 
+    async fn send_image_edit(
+        &self,
+        endpoint: &Url,
+        api_key: &str,
+        body: &Value,
+        reference_urls: &[String],
+        max_response_bytes: usize,
+        stage: &str,
+        model: &str,
+    ) -> Result<Value, ApiRequestError> {
+        let _permit = self
+            .request_semaphore
+            .acquire()
+            .await
+            .map_err(|_| ApiRequestError::new(anyhow::anyhow!("AI 请求并发控制器已关闭")))?;
+        let started = std::time::Instant::now();
+        crate::diagnostic::log(
+            "ai.request.started",
+            json!({ "stage": stage, "endpoint": endpoint.as_str(), "model": model, "referenceCount": reference_urls.len() }),
+        );
+        let form = multipart_image_form(body, reference_urls).map_err(ApiRequestError::new)?;
+        let response = match self
+            .client
+            .post(endpoint.clone())
+            .bearer_auth(api_key)
+            .multipart(form)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let message = error.to_string();
+                self.record_request(
+                    stage,
+                    endpoint,
+                    model,
+                    "error",
+                    None,
+                    started.elapsed(),
+                    &message,
+                );
+                return Err(ApiRequestError::new(anyhow::anyhow!(
+                    "{stage}请求失败：{endpoint}，模型 {model}：{message}"
+                )));
+            }
+        };
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_retry_after);
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let bytes = match read_response_limited(response, max_response_bytes).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let message = format!("{error:#}");
+                self.record_request(
+                    stage,
+                    endpoint,
+                    model,
+                    "error",
+                    Some(status.as_u16()),
+                    started.elapsed(),
+                    &message,
+                );
+                return Err(ApiRequestError::new(
+                    error.context(format!("{stage}请求失败：{endpoint}，模型 {model}")),
+                ));
+            }
+        };
+        let value = match parse_api_response(&bytes, &content_type) {
+            Ok(value) => value,
+            Err(error) => {
+                let error = error.context(format!("AI 接口 {endpoint} 响应无效"));
+                let message = format!("{error:#}");
+                self.record_request(
+                    stage,
+                    endpoint,
+                    model,
+                    "error",
+                    Some(status.as_u16()),
+                    started.elapsed(),
+                    &message,
+                );
+                return Err(ApiRequestError::new(
+                    error.context(format!("{stage}请求失败，模型 {model}")),
+                ));
+            }
+        };
+        if !status.is_success() {
+            let message = api_error_message(&value, status);
+            self.record_request(
+                stage,
+                endpoint,
+                model,
+                "error",
+                Some(status.as_u16()),
+                started.elapsed(),
+                &message,
+            );
+            return Err(ApiRequestError {
+                retry_without_json_mode: false,
+                http_status: Some(status),
+                retry_after,
+                error: anyhow::anyhow!("{stage}请求失败：{endpoint}，模型 {model}：{message}"),
+            });
+        }
+        self.record_request(
+            stage,
+            endpoint,
+            model,
+            "success",
+            Some(status.as_u16()),
+            started.elapsed(),
+            "请求成功",
+        );
+        Ok(value)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn record_request(
         &self,
@@ -1337,6 +1714,13 @@ impl AiThemeService {
             (None, None) => {}
             _ => bail!("参考图会话参数不完整"),
         }
+        self.reference_data_urls_from(references)
+    }
+
+    fn reference_data_urls_from(
+        &self,
+        references: Vec<ReferenceImage>,
+    ) -> anyhow::Result<Vec<String>> {
         if references.len() > 6 {
             bail!("参考图最多选择 6 张");
         }
@@ -1472,6 +1856,7 @@ impl From<reqwest::Error> for ApiRequestError {
 enum EndpointKind {
     Responses,
     Images,
+    ImageEdits,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1925,6 +2310,8 @@ fn generation_fingerprint(
     let mut hash = Sha256::new();
     for value in [
         request.prompt.trim(),
+        request.theme_name.trim(),
+        request.theme_description.trim(),
         request.language.trim(),
         &credentials.base_url,
         credentials.effective_image_base_url(),
@@ -1964,6 +2351,42 @@ fn generation_fingerprint(
     format!("{:x}", hash.finalize())
 }
 
+fn validate_requested_metadata(request: &GenerateRequest) -> anyhow::Result<()> {
+    let name = request.theme_name.trim();
+    let description = request.theme_description.trim();
+    if name.chars().count() > 80 || description.chars().count() > 240 {
+        bail!("主题名称或介绍超过长度限制");
+    }
+    Ok(())
+}
+
+fn prompt_with_requested_metadata(request: &GenerateRequest) -> String {
+    format!(
+        "{}\n\n用户指定的最终主题名称：{}\n用户指定的最终主题介绍：{}\n视觉蓝图、品牌文案和所有图片资源必须围绕以上名称、介绍与原始需求保持一致。",
+        request.prompt.trim(),
+        request.theme_name.trim(),
+        request.theme_description.trim()
+    )
+}
+
+fn apply_requested_metadata(
+    theme: &mut ThemeManifest,
+    request: &GenerateRequest,
+) -> anyhow::Result<()> {
+    validate_requested_metadata(request)?;
+    let name = request.theme_name.trim();
+    let description = request.theme_description.trim();
+    if !name.is_empty() {
+        theme.name = name.into();
+        theme.skin.brand.title = name.into();
+    }
+    if !description.is_empty() {
+        theme.description = description.into();
+        theme.skin.brand.subtitle = description.into();
+    }
+    Ok(())
+}
+
 fn validate_resource_plans(plans: &[ResourcePlan]) -> anyhow::Result<()> {
     if plans.len() > 16 {
         bail!("自定义生成资源不能超过 16 个");
@@ -1994,6 +2417,49 @@ fn merge_resource_plans(plans: &mut Vec<(GeneratedSlot, String)>, custom: &[Reso
             plans.push((slot, plan.prompt.trim().into()));
         }
     }
+}
+
+fn fallback_resource_plans(blueprint: &ThemeBlueprint) -> Vec<(GeneratedSlot, String)> {
+    vec![(
+        GeneratedSlot::HeroImage,
+        format!(
+            "Create a polished hero image for the {} desktop coding theme. Theme description: {}. Use the requested palette, mood, materials and visual direction. Keep the composition calm enough for readable interface content and do not include text or UI screenshots.",
+            blueprint.name.trim(),
+            blueprint.description.trim()
+        ),
+    )]
+}
+
+fn bind_user_art_direction(resource_prompt: &str, user_prompt: &str) -> String {
+    format!(
+        "{resource_prompt}\n\nBinding original user specification (must be followed in full; do not omit, generalize, or reinterpret any explicit requirement): {user_prompt}"
+    )
+}
+
+fn default_reference_indexes(reference_count: usize) -> Vec<usize> {
+    (1..=reference_count).collect()
+}
+
+fn normalize_reference_indexes(indexes: &[usize], reference_count: usize) -> Vec<usize> {
+    let mut normalized = indexes
+        .iter()
+        .copied()
+        .filter(|index| (1..=reference_count).contains(index))
+        .collect::<Vec<_>>();
+    normalized.sort_unstable();
+    normalized.dedup();
+    if normalized.is_empty() {
+        default_reference_indexes(reference_count)
+    } else {
+        normalized
+    }
+}
+
+fn selected_reference_urls(references: &[String], indexes: &[usize]) -> Vec<String> {
+    indexes
+        .iter()
+        .filter_map(|index| references.get(index.saturating_sub(1)).cloned())
+        .collect()
 }
 
 fn theme_from_blueprint(blueprint: &ThemeBlueprint) -> anyhow::Result<ThemeManifest> {
@@ -2079,7 +2545,10 @@ fn theme_from_blueprint(blueprint: &ThemeBlueprint) -> anyhow::Result<ThemeManif
         4.5,
     )?);
     theme.layout.density = blueprint.style.density.clamp(0.75, 1.35);
-    theme.layout.sidebar_width = blueprint.style.sidebar_width.clamp(180, 520);
+    theme.layout.sidebar_width = blueprint
+        .style
+        .sidebar_width
+        .clamp(180, MAX_GENERATED_SIDEBAR_WIDTH);
     theme.layout.content_max_width = blueprint.style.content_max_width.clamp(480, 2400);
     theme.shape.radius = blueprint.style.radius.min(40);
     theme.effects.panel_opacity = blueprint.style.surface_opacity.clamp(0.25, 1.0);
@@ -2354,6 +2823,7 @@ pub struct GenerationProgressItem {
     pub session: String,
     pub path: String,
     pub message: String,
+    pub reference_indexes: Vec<usize>,
 }
 
 fn normalize_image_ratio(value: &str) -> anyhow::Result<String> {
@@ -2439,6 +2909,66 @@ fn image_request_body(
     Ok(body)
 }
 
+fn multipart_image_form(body: &Value, reference_urls: &[String]) -> anyhow::Result<Form> {
+    let mut form = Form::new();
+    for key in [
+        "model",
+        "prompt",
+        "size",
+        "background",
+        "output_format",
+        "response_format",
+    ] {
+        if let Some(value) = body.get(key).and_then(Value::as_str) {
+            form = form.text(key.to_string(), value.to_string());
+        }
+    }
+    form = form.text("n", "1");
+    for (index, reference_url) in reference_urls.iter().enumerate() {
+        let (mime, bytes) = decode_reference_data_url(reference_url)?;
+        let extension = match mime {
+            "image/png" => "png",
+            "image/jpeg" => "jpg",
+            "image/webp" => "webp",
+            "image/gif" => "gif",
+            "image/bmp" => "bmp",
+            _ => bail!("不支持的参考图格式"),
+        };
+        let part = Part::bytes(bytes)
+            .file_name(format!("reference-{}.{}", index + 1, extension))
+            .mime_str(mime)
+            .context("参考图 MIME 类型无效")?;
+        form = if reference_urls.len() == 1 {
+            form.part("image", part)
+        } else {
+            form.part("image[]", part)
+        };
+    }
+    Ok(form)
+}
+
+fn decode_reference_data_url(value: &str) -> anyhow::Result<(&'static str, Vec<u8>)> {
+    let (metadata, encoded) = value
+        .strip_prefix("data:")
+        .and_then(|value| value.split_once(";base64,"))
+        .context("参考图数据格式无效")?;
+    let mime = match metadata {
+        "image/png" => "image/png",
+        "image/jpeg" => "image/jpeg",
+        "image/webp" => "image/webp",
+        "image/gif" => "image/gif",
+        "image/bmp" => "image/bmp",
+        _ => bail!("不支持的参考图格式"),
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .context("参考图无法解码")?;
+    if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
+        bail!("参考图为空或超过 15 MB");
+    }
+    Ok((mime, bytes))
+}
+
 fn validate_api_key(value: &str, label: &str) -> anyhow::Result<()> {
     if value.len() > 8_192 || value.contains(['\0', '\r', '\n']) {
         bail!("{label} 格式无效");
@@ -2483,15 +3013,18 @@ fn endpoint(base: &str, kind: EndpointKind) -> anyhow::Result<Url> {
     let suffix = match kind {
         EndpointKind::Responses => "responses",
         EndpointKind::Images => "images/generations",
+        EndpointKind::ImageEdits => "images/edits",
     };
     let path = if current.ends_with("/responses")
         || current.ends_with("/chat/completions")
         || current.ends_with("/images/generations")
+        || current.ends_with("/images/edits")
     {
         let prefix = current
             .trim_end_matches("/responses")
             .trim_end_matches("/chat/completions")
-            .trim_end_matches("/images/generations");
+            .trim_end_matches("/images/generations")
+            .trim_end_matches("/images/edits");
         format!("{prefix}/{suffix}")
     } else {
         format!("{current}/{suffix}")
@@ -2688,13 +3221,13 @@ Schema:
   "palette":{"app":"#RRGGBB","sidebar":"#RRGGBB","content":"#RRGGBB","elevated":"#RRGGBB","input":"#RRGGBB","foreground":"#RRGGBB","muted":"#RRGGBB","border":"#RRGGBB","accent":"#RRGGBB","accentForeground":"#RRGGBB","codeBackground":"#RRGGBB","codeForeground":"#RRGGBB"},
   "brand":{"title":"max 80 chars","subtitle":"max 160 chars"},
   "home":{"title":"max 120 chars","subtitle":"max 240 chars","cards":[{"title":"max 80 chars","description":"max 160 chars","prompt":"safe coding prompt"}]},
-  "style":{"radius":0-40,"density":0.75-1.35,"sidebarWidth":180-520,"contentMaxWidth":480-2400,"heroHeight":160-720,"surfaceOpacity":0.25-0.68,"blur":0-12},
+  "style":{"radius":0-40,"density":0.75-1.35,"sidebarWidth":180-360,"contentMaxWidth":480-2400,"heroHeight":160-720,"surfaceOpacity":0.25-0.68,"blur":0-12},
   "background":"none|solid|gradient|image|per-region",
   "iconStyle":"max 500 chars, concise English direction for a cohesive transparent-background IDE icon set",
-  "assets":[{"slot":"allowed slot","prompt":"English visual prompt, no text or watermark"}]
+  "assets":[{"slot":"allowed slot","prompt":"English visual prompt, no text or watermark","referenceIndexes":[1]}]
 }
 Allowed image slots: background.fullscreen, background.content, background.sidebar, skin.logo, skin.heroImage, skin.heroBadge, skin.avatar, skin.sticker, skin.composerDecoration. Do not include skin.sidebarWatermark unless the user explicitly asks for a watermark; the application owns that opt-in.
-Treat the user's original wording as a binding specification. Before composing JSON, internally enumerate every explicit requested theme, subject, color, material, mood, layout, decoration, and prohibition. Preserve those requirements in the palette and structure, and repeat the relevant concrete visual constraints inside every assets.prompt. When references are supplied, derive their actual dominant/supporting colors, material language, composition, focal placement, whitespace, decoration density, and lighting; do not substitute a generic genre-adjacent design. User text wins only where it conflicts with a reference; otherwise satisfy both.
+Treat the user's original wording as a binding specification. Before composing JSON, internally enumerate every explicit requested theme, subject, color, material, mood, layout, decoration, and prohibition. Preserve those requirements in the palette and structure, and repeat the relevant concrete visual constraints inside every assets.prompt. When references are supplied, derive their actual dominant/supporting colors, material language, composition, focal placement, whitespace, decoration density, and lighting; do not substitute a generic genre-adjacent design. User text wins only where it conflicts with a reference; otherwise satisfy both. The supplied references are numbered in order starting at 1. For every image asset, assign the specific source references that should guide that asset in referenceIndexes; never leave this field out when references are supplied. Use an empty array only when an asset must intentionally avoid all references.
 Use strict valid JSON syntax with double-quoted property names and strings. Every palette value must be exactly seven ASCII characters in #RRGGBB form; never emit shorthand, named colors, rgb(), alpha, #RRGGBBAA, transparent, or gradients in palette fields. Use the language explicitly requested by the user for every user-facing name, description, brand string, home title, subtitle, and card string. Use at most 4 cards and at most 6 assets. Prefer skin.heroImage plus only assets that materially improve the requested design. Never design, describe, or restyle the operating-system title bar, Codex task header, window controls, settings controls, send button, permission controls, or other native interaction chrome; those remain native and must stay clearly recognizable. System action icons and sidebar watermarks are controlled by explicit application options; never add them to assets automatically. Background and Hero images must be clear, crisp, and recognizable, not heavily blurred ambience; keep the lower-left text area relatively calm and low-detail, and prefer blur 0-4 and surfaceOpacity 0.25-0.44 so imagery remains visible while protected text surfaces stay readable.
 Treat readability as a hard constraint, not an aesthetic suggestion. Calculate WCAG 2 relative-luminance contrast before returning JSON: palette.foreground must be at least 4.5:1 against app, sidebar, content, elevated, and input; muted must be at least 3:1 against all five surfaces; accentForeground must be at least 4.5:1 against accent; codeForeground must be at least 7:1 against codeBackground. The accent/accentForeground pair is used by primary controls including the send button, so its icon must remain unmistakable in default, hover, active, and disabled states. Title-bar labels, the Codex task-header title and controls, sidebar labels, terminal text, editor text, and code-review text must never use the same or a near-identical color as their background. Code-review additions, deletions, unchanged rows, inline highlights, and selected rows must retain at least 4.5:1 text contrast and avoid competing saturated red/green fills. Borders, icons, focus indicators, and essential controls should reach 3:1 against adjacent surfaces. Verify both default and hover/active states, and keep native light settings cards readable even when the requested theme is dark. Do not imitate a living artist, include copyrighted logos, or request readable text inside generated images."##
 }
@@ -3143,6 +3676,85 @@ mod tests {
     use crate::storage::ThemeStore;
     use image::GenericImageView;
 
+    fn test_generate_request(prompt: &str) -> GenerateRequest {
+        GenerateRequest {
+            prompt: prompt.into(),
+            theme_name: "指定主题".into(),
+            theme_description: "指定介绍".into(),
+            language: "zh-CN".into(),
+            generate_images: true,
+            generate_sidebar_watermark: false,
+            generate_system_icons: false,
+            image_concurrency: 2,
+            reference_session: None,
+            reference_path: None,
+            references: Vec::new(),
+            resource_plans: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn planning_resets_previous_progress_and_caps_image_concurrency() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_root(temp.path().join("ThemeInject"));
+        paths.ensure().unwrap();
+        let service =
+            AiThemeService::new(paths, "http://127.0.0.1:1".into(), "token".into()).unwrap();
+        service
+            .generation_progress
+            .lock()
+            .unwrap()
+            .items
+            .push(GenerationProgressItem {
+                slot: "skin.resources.heroImage".into(),
+                label: "Hero 图片".into(),
+                prompt: "旧主题资源".into(),
+                status: "completed".into(),
+                preview_url: String::new(),
+                session: String::new(),
+                path: String::new(),
+                message: String::new(),
+                reference_indexes: Vec::new(),
+            });
+        service.set_generation_state("planning", "开始新主题");
+        assert!(service.generation_progress().items.is_empty());
+        assert_eq!(default_image_concurrency(), 4);
+        assert_eq!(123usize.clamp(1, MAX_IMAGE_GENERATION_CONCURRENCY), 4);
+    }
+
+    #[test]
+    fn requested_metadata_overrides_theme_and_brand() {
+        let mut theme = theme_from_blueprint(&blueprint()).unwrap();
+        let request = test_generate_request("粉丝主题");
+        apply_requested_metadata(&mut theme, &request).unwrap();
+        assert_eq!(theme.name, "指定主题");
+        assert_eq!(theme.description, "指定介绍");
+        assert_eq!(theme.skin.brand.title, "指定主题");
+        assert_eq!(theme.skin.brand.subtitle, "指定介绍");
+        assert!(prompt_with_requested_metadata(&request).contains("指定主题"));
+    }
+
+    #[test]
+    fn generation_fingerprint_changes_with_user_metadata() {
+        let credentials = AiCredentials {
+            base_url: "https://example.com/v1".into(),
+            image_base_url: String::new(),
+            text_model: "text".into(),
+            vision_model: "vision".into(),
+            image_model: "image".into(),
+            image_size: "3:2".into(),
+            api_key: "key".into(),
+            image_api_key: Some("image-key".into()),
+        };
+        let original = test_generate_request("同一提示词");
+        let mut renamed = test_generate_request("同一提示词");
+        renamed.theme_name = "另一个主题".into();
+        assert_ne!(
+            generation_fingerprint(&original, &[], &credentials),
+            generation_fingerprint(&renamed, &[], &credentials)
+        );
+    }
+
     fn blueprint() -> ThemeBlueprint {
         serde_json::from_value(json!({
             "name": "Aurora Studio",
@@ -3172,6 +3784,14 @@ mod tests {
         assert!(theme.skin.home.enabled);
         assert_eq!(theme.skin.home.cards.len(), 1);
         theme.validate().unwrap();
+    }
+
+    #[test]
+    fn generated_theme_clamps_sidebar_width() {
+        let mut blueprint = blueprint();
+        blueprint.style.sidebar_width = 520;
+        let theme = theme_from_blueprint(&blueprint).unwrap();
+        assert_eq!(theme.layout.sidebar_width, MAX_GENERATED_SIDEBAR_WIDTH);
     }
 
     fn assert_contrast(foreground: &str, background: &str, minimum: f64) {
@@ -3349,6 +3969,65 @@ mod tests {
     }
 
     #[test]
+    fn resource_prompt_keeps_original_user_constraints() {
+        let prompt = bind_user_art_direction(
+            "paint a dark coding background",
+            "必须有红色机甲，禁止模糊，不要蓝色",
+        );
+        assert!(prompt.contains("必须有红色机甲，禁止模糊，不要蓝色"));
+        assert!(prompt.contains("must be followed in full"));
+        assert!(prompt.contains("do not omit, generalize, or reinterpret"));
+    }
+
+    #[test]
+    fn reference_assignments_are_one_based_and_never_empty() {
+        assert_eq!(normalize_reference_indexes(&[3, 1, 1, 9], 3), vec![1, 3]);
+        assert_eq!(normalize_reference_indexes(&[], 2), vec![1, 2]);
+        assert_eq!(normalize_reference_indexes(&[0, 8], 2), vec![1, 2]);
+        let references = vec!["one".into(), "two".into(), "three".into()];
+        assert_eq!(
+            selected_reference_urls(&references, &[3, 1]),
+            vec!["three".to_string(), "one".to_string()]
+        );
+    }
+
+    #[test]
+    fn blueprint_assets_preserve_reference_indexes() {
+        let blueprint = serde_json::from_value::<ThemeBlueprint>(json!({
+            "name": "Reference plan",
+            "palette": {
+                "app": "#101010", "sidebar": "#121212", "content": "#141414",
+                "elevated": "#181818", "input": "#1A1A1A", "foreground": "#F5F5F5",
+                "muted": "#BBBBBB", "border": "#555555", "accent": "#22CCCC",
+                "accentForeground": "#001010", "codeBackground": "#080808", "codeForeground": "#EEEEEE"
+            },
+            "assets": [{ "slot": "skin.heroImage", "prompt": "use the subject", "referenceIndexes": [2] }]
+        })).unwrap();
+        assert_eq!(blueprint.assets[0].reference_indexes, vec![2]);
+    }
+
+    #[test]
+    fn fallback_resource_plan_exists_without_blueprint_assets() {
+        let mut blueprint = blueprint();
+        blueprint.assets.clear();
+        blueprint.home.cards.clear();
+        let plans = fallback_resource_plans(&blueprint);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].0, GeneratedSlot::HeroImage);
+        assert!(plans[0].1.contains("Aurora Studio"));
+    }
+
+    #[test]
+    fn multipart_reference_data_url_is_decoded_safely() {
+        let encoded = base64::engine::general_purpose::STANDARD.encode([1_u8, 2, 3]);
+        let (mime, bytes) =
+            decode_reference_data_url(&format!("data:image/png;base64,{encoded}")).unwrap();
+        assert_eq!(mime, "image/png");
+        assert_eq!(bytes, vec![1, 2, 3]);
+        assert!(decode_reference_data_url("data:text/plain;base64,QQ==").is_err());
+    }
+
+    #[test]
     fn plans_and_applies_automatic_icons() {
         let blueprint = blueprint();
         let plans = icon_generation_plans(&blueprint);
@@ -3421,6 +4100,12 @@ mod tests {
             .unwrap()
             .as_str(),
             "https://api.example.com/v1/images/generations"
+        );
+        assert_eq!(
+            endpoint("https://api.example.com/v1", EndpointKind::ImageEdits)
+                .unwrap()
+                .as_str(),
+            "https://api.example.com/v1/images/edits"
         );
     }
 
@@ -3543,6 +4228,7 @@ mod tests {
                 &credentials,
                 GeneratedSlot::ActionIcon("search"),
                 "test icon",
+                &[],
                 "d",
             )
             .await
@@ -3848,11 +4534,14 @@ mod tests {
             .unwrap();
         let mut theme = theme_from_blueprint(&blueprint()).unwrap();
         apply_generated_slot(&mut theme, slot, &staged.path).unwrap();
+        let request = test_generate_request("checkpoint theme");
         service
             .save_checkpoint(
                 "fingerprint",
+                &request,
                 &theme,
                 &[(slot, "hero prompt".into())],
+                &BTreeMap::new(),
                 std::slice::from_ref(&staged),
             )
             .unwrap();
@@ -3887,11 +4576,14 @@ mod tests {
             .unwrap();
         let mut theme = theme_from_blueprint(&blueprint()).unwrap();
         apply_generated_slot(&mut theme, slot, &staged.path).unwrap();
+        let request = test_generate_request("restored theme");
         service
             .save_checkpoint(
                 "unavailable-original-fingerprint",
+                &request,
                 &theme,
                 &[(slot, "hero prompt".into())],
+                &BTreeMap::new(),
                 std::slice::from_ref(&staged),
             )
             .unwrap();
@@ -3917,8 +4609,16 @@ mod tests {
             .unwrap();
         let mut theme = theme_from_blueprint(&blueprint()).unwrap();
         apply_generated_slot(&mut theme, slot, &staged.path).unwrap();
+        let request = test_generate_request("missing asset");
         service
-            .save_checkpoint("fingerprint", &theme, &[], std::slice::from_ref(&staged))
+            .save_checkpoint(
+                "fingerprint",
+                &request,
+                &theme,
+                &[],
+                &BTreeMap::new(),
+                std::slice::from_ref(&staged),
+            )
             .unwrap();
         fs::remove_file(paths.staging.join(&staged.session).join(&staged.path)).unwrap();
 
@@ -4121,6 +4821,8 @@ mod tests {
         let generated = service
             .generate(GenerateRequest {
                 prompt: "生成海洋主题".into(),
+                theme_name: String::new(),
+                theme_description: String::new(),
                 language: "zh-CN".into(),
                 generate_images: true,
                 generate_sidebar_watermark: false,

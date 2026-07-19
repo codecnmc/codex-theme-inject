@@ -17,6 +17,7 @@
   const TERMINAL_ANSI_NAMES = ["Black", "Red", "Green", "Yellow", "Blue", "Magenta", "Cyan", "White", "BrightBlack", "BrightRed", "BrightGreen", "BrightYellow", "BrightBlue", "BrightMagenta", "BrightCyan", "BrightWhite"];
   const TERMINAL_TOKEN_NAMES = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white", "bright-black", "bright-red", "bright-green", "bright-yellow", "bright-blue", "bright-magenta", "bright-cyan", "bright-white"];
   const PANEL_CSS = __THEME_INJECT_PANEL_CSS_JSON__;
+  const TOOLBAR_ICON = __THEME_INJECT_ICON_DATA_URL_JSON__;
   const nonce = window.__THEME_INJECT_NONCE__;
   const callbacks = new Map();
   let assetUrls = new Map();
@@ -38,6 +39,7 @@
   let draftPreviewDeadline = 0;
   let studioPreviewTimer = 0;
   let studioPreviewDeadline = 0;
+  let studioDomTimer = 0;
   let modal = null;
   let busy = false;
   let statusMessage = "";
@@ -46,10 +48,12 @@
   let aiApiKeyDraft = "";
   let aiImageApiKeyDraft = "";
   let aiPrompt = "";
+  let aiThemeName = "";
+  let aiThemeDescription = "";
   let aiGenerateImages = true;
   let aiGenerateSidebarWatermark = false;
   let aiGenerateSystemIcons = false;
-  let aiImageConcurrency = 2;
+  let aiImageConcurrency = 4;
   let aiLanguage = "zh-CN";
   let aiReferences = [];
   let aiRequestLog = [];
@@ -66,9 +70,14 @@
   let assetRetryThemeId = "";
   let assetRetrySignature = "";
   let assetRetryPaths = new Set();
+  const themeThumbnailUrls = new Map();
+  const themeThumbnailRequests = new Map();
   let studioSelectedDecoration = -1;
   let studioSaveOpen = false;
   let aiGeneratedDraft = false;
+  let studioPreviewRefreshPending = false;
+  let studioPreviewReady = false;
+  let studioPreviewPreparing = false;
   let studioBaseline = null;
   let panelScrollTop = 0;
   let studioPaneScrollTop = 0;
@@ -77,6 +86,9 @@
   let brandSignature = "";
   let decorationsSignature = "";
   let homeSignature = "";
+  let cssInspectorCleanup = null;
+  let triggerAppearanceDraft = null;
+  let rendererErrorReportAt = 0;
 
   if (window.__themeInjectRuntime?.destroy) window.__themeInjectRuntime.destroy();
 
@@ -93,11 +105,11 @@
     if (destroyed) return Promise.reject(new Error("Theme Inject reloaded"));
     return new Promise((resolve, reject) => {
       const id = `${Date.now()}-${++requestSequence}`;
-      const timeout = method === "ai.generate"
+      const timeout = ["ai.generate", "ai.resource.generate"].includes(method)
         ? 25 * 60 * 1000
         : ["theme.preview.data", "theme.preview.thumbnail", "theme.background.data"].includes(method)
           ? 2 * 60 * 1000
-          : ["theme.package.import", "theme.package.export", "theme.background.import", "theme.asset.import", "ai.reference.import", "ai.reference.upload"].includes(method)
+          : ["theme.package.import", "theme.package.export", "theme.background.import", "theme.asset.import", "ai.reference.import", "ai.reference.upload", "app.trigger.icon.import"].includes(method)
             ? 10 * 60 * 1000
             : 16000;
       const timer = setTimeout(() => {
@@ -109,11 +121,31 @@
     });
   };
 
+  function reportRendererError(event, detail) {
+    if (String(detail?.message || "").startsWith("ResizeObserver loop")) return;
+    const now = Date.now();
+    if (now - rendererErrorReportAt < 1000) return;
+    rendererErrorReportAt = now;
+    void call("diagnostics.report", { event, ...detail }).catch(() => {});
+  }
+
+  window.addEventListener("error", event => reportRendererError("renderer.error", {
+    message: String(event?.message || event?.error?.message || "未知脚本错误").slice(0, 1000),
+    source: String(event?.filename || "").slice(0, 500),
+    line: event?.lineno || 0,
+    column: event?.colno || 0,
+    stack: String(event?.error?.stack || "").slice(0, 2000),
+  }));
+  window.addEventListener("unhandledrejection", event => reportRendererError("renderer.unhandled_rejection", {
+    message: String(event?.reason?.message || event?.reason || "未处理的 Promise 拒绝").slice(0, 1000),
+    stack: String(event?.reason?.stack || "").slice(0, 2000),
+  }));
+
   window.themeInject = { call };
 
   const tabs = [
     ["library", "主题库"], ["colors", "颜色"], ["background", "背景"], ["type", "字体"],
-    ["layout", "布局"], ["effects", "效果"], ["terminal", "终端"], ["skin", "皮肤"], ["ai", "AI 生成"], ["advanced", "高级"],
+    ["effects", "效果"], ["terminal", "终端"], ["skin", "皮肤"], ["ai", "AI 生成"], ["advanced", "高级"],
   ];
   const colorFields = [
     ["appBackground", "应用背景"], ["sidebarBackground", "侧边栏"], ["contentBackground", "内容区"],
@@ -195,27 +227,48 @@
   function resolvedAsset(theme, relative) { return stagedUrls.get(relative) || (assetCacheThemeId === theme?.id ? assetUrls.get(relative) : "") || assetUrl(theme, relative); }
   function isPreviewDataUrl(value) { return typeof value === "string" && value.startsWith("data:image/"); }
   function isPreviewImageUrl(value) { return isPreviewDataUrl(value) || (typeof value === "string" && /^https?:\/\//i.test(value)); }
-  async function previewDataUrl(asset) {
-    const cached = thumbnailUrls.get(asset?.path) || "";
+  function previewCacheKey(asset) { return asset?.session && asset?.path ? `${asset.session}:${asset.path}` : asset?.path || ""; }
+  async function previewDataUrl(asset, attempts = 4, allowFullFallback = true) {
+    const key = previewCacheKey(asset);
+    const cached = thumbnailUrls.get(key) || (!asset?.session ? thumbnailUrls.get(asset?.path) : "") || "";
     if (cached || !asset?.session || !asset?.path) return cached;
-    try {
-      const result = await call("theme.preview.thumbnail", { session: asset.session, path: asset.path });
-      const url = isPreviewDataUrl(result.url) ? result.url : "";
-      if (url && asset?.path) thumbnailUrls.set(asset.path, url);
-      return url;
-    } catch {
-      return "";
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        const result = await call("theme.preview.thumbnail", { session: asset.session, path: asset.path });
+        const url = isPreviewDataUrl(result.url) ? result.url : "";
+        if (url) {
+          thumbnailUrls.set(key, url);
+          thumbnailUrls.set(asset.path, url);
+          return url;
+        }
+      } catch {}
+      if (attempt + 1 < attempts) await waitFor([250, 750, 1500][Math.min(attempt, 2)]);
     }
+    if (!allowFullFallback) return "";
+    try {
+      const result = await call("theme.preview.data", { session: asset.session, path: asset.path });
+      const url = isPreviewDataUrl(result.url) ? result.url : "";
+      if (url) {
+        thumbnailUrls.set(key, url);
+        thumbnailUrls.set(asset.path, url);
+        return url;
+      }
+    } catch {}
+    return "";
   }
   async function loadStagedAssetUrls(assets, shouldContinue = () => true) {
-    const loaded = await mapConcurrent((assets || []).filter(asset => asset?.path), 3, async asset => {
+    const direct = (assets || [])
+      .filter(asset => asset?.path && isPreviewImageUrl(asset.previewUrl))
+      .map(asset => [asset.path, asset.previewUrl]);
+    const pending = (assets || []).filter(asset => asset?.path && !isPreviewImageUrl(asset.previewUrl));
+    const loaded = await mapConcurrent(pending, 1, async asset => {
       try {
         const result = await call("theme.preview.data", { session: asset.session, path: asset.path });
-        return [asset.path, isPreviewDataUrl(result.url) ? result.url : ""];
+        return [asset.path, isPreviewImageUrl(result.url) ? result.url : ""];
       } catch { return [asset.path, ""]; }
     });
     if (!shouldContinue()) return null;
-    const urls = new Map(loaded.filter(([, url]) => url));
+    const urls = new Map([...direct, ...loaded].filter(([, url]) => url));
     return urls;
   }
   async function cacheStagedAssetUrls(assets, shouldContinue = () => true) {
@@ -292,7 +345,7 @@
       void hydrateAssets(draft, { retryAttempt: attempt + 1 }).then(result => {
         if (result === null || destroyed || lifecycle !== lifecycleEpoch || draft?.id !== theme.id) return;
         applyTheme(draft, state?.customCssTrusted ? draftCustomCss : "");
-        if (studioOpen) renderStudio(true);
+        if (studioOpen) renderStudio(busy ? false : true);
         else if (document.getElementById(PANEL_ID)?.dataset.open === "true") renderPanel();
       });
     }, delay);
@@ -307,16 +360,16 @@
     const assets = new Map((result.assets || []).map(asset => [asset.slot, asset]));
     const mappings = result.theme?.skin?.icons?.mappings || {};
     const atlas = assets.get("skin.icons.atlas");
-    if (!atlas?.path || !isPreviewDataUrl(urls.get(atlas.path))) return false;
+    if (!atlas?.path || !isPreviewImageUrl(urls.get(atlas.path))) return false;
     return slots.every(slot => {
       const action = slot.slice("skin.icons.".length);
       const asset = assets.get(slot);
-      return asset?.path && mappings[action] === asset.path && isPreviewDataUrl(urls.get(asset.path));
+      return asset?.path && mappings[action] === asset.path && isPreviewImageUrl(urls.get(asset.path));
     });
   }
   function generationUrlsComplete(result, urls) {
     const assets = (result?.assets || []).filter(asset => asset?.path);
-    return assets.every(asset => isPreviewDataUrl(urls.get(asset.path))) && atlasRestoreComplete(result, urls);
+    return assets.every(asset => isPreviewImageUrl(urls.get(asset.path))) && atlasRestoreComplete(result, urls);
   }
   async function loadCompleteGenerationUrls(result, shouldContinue = () => true, attempts = 1) {
     for (let attempt = 0; attempt < attempts; attempt += 1) {
@@ -328,12 +381,12 @@
     }
     return null;
   }
-  async function restoreCompleteGeneration(initialResult, shouldContinue = () => true, attempts = 3) {
+  async function restoreCompleteGeneration(initialResult, shouldContinue = () => true, attempts = 3, restoreParams = null) {
     let result = initialResult;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       if (attempt > 0 || !result) {
         try {
-          result = await call("ai.generation.restore");
+          result = await call("ai.generation.restore", restoreParams || {});
         } catch {
           result = null;
         }
@@ -470,6 +523,8 @@
     const diffRemovedText = rgbaFromHex(mixColor(codeBase, diffDanger, .34), .9);
     const lineNumber = safeForeground(codeBase, tokens.mutedForeground, 3.2);
     const density = layout.density || 1, baseFontSize = 14 * (type.scale || 1);
+    const sidebarWidth = Math.max(180, Math.min(360, Number(layout.sidebarWidth) || 300));
+    const contentMaxWidth = Math.max(480, Math.min(2400, Number(layout.contentMaxWidth) || 960));
     const shadowAlpha = Math.max(0, Math.min(.48, (effects.shadowStrength || 0) * .48));
     const effectiveBorder = colorContrast(tokens.border, tokens.inputBackground) < 1.35 ? mixColor(tokens.inputBackground, tokens.foreground, .28) : tokens.border;
     const skinEnabled = Boolean(skin.enabled);
@@ -488,7 +543,7 @@
   --ti-sidebar-fg:${sidebarForeground};--ti-sidebar-muted:${sidebarMuted};--ti-sidebar-icon:${sidebarIcon};--ti-sidebar-border:${sidebarBorder};--ti-sidebar-hover:${sidebarHover};--ti-sidebar-selected:${sidebarSelected};--ti-sidebar-selected-fg:${sidebarSelectedForeground};--ti-skin-sidebar-fill:${surfaces.sidebar?.fill || tokens.sidebarBackground};
   --ti-content-fg:${contentForeground};--ti-content-muted:${contentMuted};--ti-hero-fg:${heroForeground};--ti-hero-muted:${heroMuted};--ti-hero-protection:rgba(${heroProtection},.88);--ti-hero-protection-soft:rgba(${heroProtection},.58);--ti-card-fg:${cardForeground};--ti-card-muted:${cardMuted};--ti-composer-fg:${composerForeground};--ti-composer-muted:${composerMuted};--ti-popover-fg:${popoverForeground};--ti-popover-muted:${popoverMuted};
   --ti-skin-icon:${skin.icons?.color || sidebarIcon};--ti-skin-icon-active:${skin.icons?.activeColor || tokens.accent};
-  --spacing-token-sidebar:${layout.sidebarWidth}px;--thread-content-max-width:${layout.contentMaxWidth}px;--conversation-item-gap:${Math.round(16 * density)}px;
+  --ti-decoration-sidebar-width:${sidebarWidth}px;--thread-content-max-width:${contentMaxWidth}px;--conversation-item-gap:${Math.round(16 * density)}px;
   --token-foreground:${tokens.foreground};--token-text-primary:${tokens.foreground};--token-text-secondary:${tokens.mutedForeground};--token-text-tertiary:${tokens.subtleForeground};
   --token-border:${effectiveBorder};--token-bg-fog:${tokens.elevatedBackground};--token-list-hover-background:${tokens.hoverBackground};--token-button-tertiary-foreground:${tokens.mutedForeground};
   --color-token-foreground:${tokens.foreground};--color-token-border:${effectiveBorder};--color-token-text-primary:${tokens.foreground};--color-token-text-secondary:${tokens.mutedForeground};
@@ -527,8 +582,13 @@ body>#root,body>[data-reactroot],#__next{position:relative;z-index:1;background:
 .app-header-tint svg [stroke]:not([stroke="none"]),[data-theme-inject-titlebar-text="true"] svg [stroke]:not([stroke="none"]){stroke:currentColor!important;}
 .app-header-tint [data-testid="app-shell-header-context-menu-surface"],.app-header-tint [data-testid="app-shell-header-context-menu-surface"] *{color:var(--ti-titlebar-fg)!important;}
 [data-theme-inject-task-header="true"]{left:var(--ti-main-left,0px)!important;right:0!important;width:auto!important;}
-.app-shell-left-panel{position:relative!important;isolation:isolate;color:var(--ti-sidebar-fg)!important;background-color:${sidebarActive ? "transparent" : "var(--ti-sidebar)"}!important;border-color:var(--ti-sidebar-border)!important;width:${layout.sidebarWidth}px!important;min-width:${layout.sidebarWidth}px!important;--height-token-row:${Math.round(30*density)}px;--height-token-nav-row:${Math.round(30*density)}px;--padding-row-x:${Math.max(5,Math.round(8*density))}px;--token-foreground:var(--ti-sidebar-fg);--token-text-primary:var(--ti-sidebar-fg);--token-text-secondary:var(--ti-sidebar-muted);--token-text-tertiary:var(--ti-sidebar-muted);--token-muted-foreground:var(--ti-sidebar-muted);--token-list-hover-background:var(--ti-sidebar-hover);--color-token-side-bar-foreground:var(--ti-sidebar-fg);${skinEnabled ? surfaceCss(surfaces.sidebar,tokens.sidebarBackground,sidebarBorder,0,{radius:false,maxOpacity:sidebarOpacity}) : ""}}
+.app-shell-left-panel{position:relative!important;isolation:isolate;color:var(--ti-sidebar-fg)!important;background-color:${sidebarActive ? "transparent" : "var(--ti-sidebar)"}!important;border-color:var(--ti-sidebar-border)!important;box-sizing:border-box!important;overflow-x:hidden!important;--height-token-row:${Math.round(30*density)}px;--height-token-nav-row:${Math.round(30*density)}px;--padding-row-x:${Math.max(5,Math.round(8*density))}px;--token-foreground:var(--ti-sidebar-fg);--token-text-primary:var(--ti-sidebar-fg);--token-text-secondary:var(--ti-sidebar-muted);--token-text-tertiary:var(--ti-sidebar-muted);--token-muted-foreground:var(--ti-sidebar-muted);--token-list-hover-background:var(--ti-sidebar-hover);--color-token-side-bar-foreground:var(--ti-sidebar-fg);${skinEnabled ? surfaceCss(surfaces.sidebar,tokens.sidebarBackground,sidebarBorder,0,{radius:false,maxOpacity:sidebarOpacity}) : ""}}
 .app-shell-left-panel>*{position:relative;z-index:1;}
+.app-shell-left-panel{box-sizing:border-box;}.app-shell-left-panel *{box-sizing:border-box;max-width:100%;}
+.app-shell-left-panel nav,.app-shell-left-panel [data-app-action-sidebar-section]{min-width:0;max-width:100%;overflow-x:hidden;}
+.app-shell-left-panel :is([data-app-action-sidebar-thread-id],[data-app-action-sidebar-project-row]){min-width:0;max-width:100%;overflow:hidden;}
+.app-shell-left-panel :is([data-app-action-sidebar-thread-id],[data-app-action-sidebar-project-row]) :is(span,div){min-width:0;max-width:100%;}
+.app-shell-left-panel :is([data-app-action-sidebar-thread-id],[data-app-action-sidebar-project-row]) span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .app-shell-left-panel nav,.app-shell-left-panel [data-app-action-sidebar-section]{background-color:transparent!important;}
 .app-shell-left-panel svg{color:var(--ti-sidebar-icon)!important;stroke:currentColor!important;}
 .app-shell-left-panel [data-app-action-sidebar-section-heading],.app-shell-left-panel .text-token-text-tertiary,.app-shell-left-panel .text-token-muted-foreground{color:var(--ti-sidebar-muted)!important;}
@@ -540,7 +600,7 @@ body>#root,body>[data-reactroot],#__next{position:relative;z-index:1;background:
 .app-shell-left-panel [data-app-action-sidebar-thread-active="true"] *,.app-shell-left-panel [data-app-action-sidebar-thread-active="true"] svg{color:var(--ti-sidebar-selected-fg)!important;}
 .main-surface{position:relative!important;isolation:isolate;background-color:${contentActive ? "transparent" : "var(--ti-content)"}!important;color:var(--ti-content-fg)!important;--token-foreground:var(--ti-content-fg);--token-text-primary:var(--ti-content-fg);--token-text-secondary:var(--ti-content-muted);--color-token-foreground:var(--ti-content-fg);--color-token-text-primary:var(--ti-content-fg);--color-token-text-secondary:var(--ti-content-muted);${skinEnabled ? surfaceCss(surfaces.content,tokens.contentBackground,effectiveBorder,shape.radius,{maxOpacity:effectiveContentOpacity,blur:false}) : ""}}
 .app-shell-main-content-viewport,.thread-scroll-container{background:transparent!important;}
-.main-surface,.main-surface *{--thread-content-max-width:${layout.contentMaxWidth}px!important;--composer-adjacent-max-width:calc(${layout.contentMaxWidth}px + 22px)!important;}
+.main-surface,.main-surface *{--thread-content-max-width:${contentMaxWidth}px!important;--composer-adjacent-max-width:calc(${contentMaxWidth}px + 22px)!important;}
 #${BACKDROP_IDS.fullscreen},#${BACKDROP_IDS.content},#${BACKDROP_IDS.sidebar}{pointer-events:none!important;overflow:hidden!important;}
 #${BACKDROP_IDS.content},#${BACKDROP_IDS.sidebar}{z-index:-1!important;}
 [data-theme-inject-custom-icon]{position:relative;}
@@ -553,7 +613,7 @@ ${skinEnabled && skin.icons?.mode !== "native" ? `.app-shell-left-panel button s
 [data-theme-inject-button-contrast="true"]{color:var(--ti-native-button-fg)!important;}
 [data-theme-inject-button-contrast="true"] svg{color:var(--ti-native-button-fg)!important;fill:currentColor!important;stroke:currentColor!important;opacity:1!important;}
 [data-turn-key],[data-codex-composer-root],.text-size-chat{font-size:${baseFontSize}px;line-height:${type.lineHeight};}
-[data-thread-scroll-footer]{--thread-content-max-width:${layout.contentMaxWidth}px;}
+[data-thread-scroll-footer]{--thread-content-max-width:${contentMaxWidth}px;}
 .composer-surface-chrome,[data-codex-composer-root] .composer-surface-chrome{background-color:var(--ti-input)!important;color:var(--ti-composer-fg)!important;border:var(--ti-border-width) solid var(--ti-border)!important;border-radius:var(--ti-radius)!important;box-shadow:var(--ti-shadow)!important;--token-foreground:var(--ti-composer-fg);--token-text-primary:var(--ti-composer-fg);--token-text-tertiary:var(--ti-composer-muted);${skinEnabled ? surfaceCss(surfaces.composer,tokens.inputBackground,effectiveBorder,shape.radius) : ""}}
 .composer-surface-chrome *,[data-codex-composer="true"]{caret-color:var(--ti-composer-fg);}[data-codex-composer="true"]{color:var(--ti-composer-fg)!important;}[data-codex-composer="true"] p,[data-codex-composer="true"] span{color:inherit;}[data-codex-composer="true"][data-placeholder]:empty::before{color:var(--ti-composer-muted)!important;}
 [role="dialog"],[role="menu"],[role="listbox"],[data-radix-popper-content-wrapper]>*{background-color:var(--ti-elevated)!important;color:var(--ti-popover-fg)!important;border-color:var(--ti-border)!important;--token-foreground:var(--ti-popover-fg);--token-text-primary:var(--ti-popover-fg);${skinEnabled ? surfaceCss(surfaces.popover,tokens.elevatedBackground,effectiveBorder,shape.radius) : ""}}
@@ -940,13 +1000,14 @@ ${customCss || ""}`;
   }
 
   function panelHtml() {
-    return `<div class="ti-header"><div><h2 class="ti-title">Theme Inject</h2><div class="ti-subtitle">实时定制 Codex 视觉系统</div></div><div class="ti-header-actions"><button class="ti-icon-button" data-action="reinject">重新注入</button><button class="ti-icon-button" data-action="close">关闭</button></div></div><div class="ti-tabs">${tabs.map(([id, label]) => `<button class="ti-tab" data-tab="${id}" data-active="${id === activeTab}">${label}</button>`).join("")}</div><div class="ti-body">${tabs.map(([id]) => `<section class="ti-section" data-section="${id}" data-active="${id === activeTab}">${sectionHtml(id)}</section>`).join("")}</div><div class="ti-footer"><div class="ti-status" data-kind="${escapeHtml(statusKind)}">${escapeHtml(statusMessage || (dirty ? "有未应用修改" : "已同步"))}</div><div class="ti-footer-actions"><button class="ti-button" data-action="cancel">放弃</button><button class="ti-button" data-primary="true" data-action="apply">应用</button></div></div>${modalHtml()}`;
+    return `<div class="ti-header"><div class="ti-header-brand"><img class="ti-brand-watermark" src="${TOOLBAR_ICON}" alt="Theme Inject" title="Theme Inject"><div><h2 class="ti-title">Codex 主题</h2><div class="ti-subtitle">实时定制 Codex 视觉系统</div></div></div><div class="ti-header-actions"><button class="ti-icon-button" data-action="reinject">重新注入</button><button class="ti-icon-button" data-action="close">关闭</button></div></div><div class="ti-tabs">${tabs.map(([id, label]) => `<button class="ti-tab" data-tab="${id}" data-active="${id === activeTab}">${label}</button>`).join("")}</div><div class="ti-body">${tabs.map(([id]) => `<section class="ti-section" data-section="${id}" data-active="${id === activeTab}">${sectionHtml(id)}</section>`).join("")}</div><div class="ti-footer"><div class="ti-status" data-kind="${escapeHtml(statusKind)}">${escapeHtml(statusMessage || (dirty ? "有未应用修改" : "已同步"))}</div><div class="ti-footer-actions"><button class="ti-button" data-action="cancel">放弃</button><button class="ti-button" data-primary="true" data-action="apply">应用</button></div></div>${modalHtml()}`;
   }
 
   function modalHtml() {
     if (!modal) return "";
     if (modal.kind === "create") return `<div class="ti-modal-backdrop"><form class="ti-modal" data-modal-form="create"><div class="ti-modal-title">新建主题</div><div class="ti-modal-copy">以“${escapeHtml(draft.name)}”为基础创建一个可编辑副本。</div><label class="ti-field-label" for="ti-theme-name">主题名称</label><input id="ti-theme-name" class="ti-control" data-modal-name maxlength="80" value="${escapeHtml(modal.defaultValue)}" autocomplete="off"><div class="ti-modal-actions"><button class="ti-button" type="button" data-modal-cancel>取消</button><button class="ti-button" data-primary="true" type="submit">创建并切换</button></div></form></div>`;
-    if (modal.kind === "delete") return `<div class="ti-modal-backdrop"><div class="ti-modal"><div class="ti-modal-title">删除主题</div><div class="ti-modal-copy">确定删除“${escapeHtml(draft.name)}”？此操作无法撤销。</div><div class="ti-modal-actions"><button class="ti-button" type="button" data-modal-cancel>取消</button><button class="ti-button" data-danger="true" type="button" data-modal-confirm="delete">删除</button></div></div></div>`;
+    if (modal.kind === "delete") return `<div class="ti-modal-backdrop"><div class="ti-modal"><div class="ti-modal-title">删除主题</div><div class="ti-modal-copy">确定删除“${escapeHtml(modal.theme.name)}”？此操作无法撤销。</div><div class="ti-modal-actions"><button class="ti-button" type="button" data-modal-cancel>取消</button><button class="ti-button" data-danger="true" type="button" data-modal-confirm="delete">删除</button></div></div></div>`;
+    if (modal.kind === "edit-theme") return `<div class="ti-modal-backdrop"><form class="ti-modal" data-modal-form="edit-theme"><div class="ti-modal-title">编辑主题信息</div><div class="ti-modal-copy">修改主题库中显示的名称和介绍。</div><label class="ti-field-label" for="ti-edit-theme-name">主题名称</label><input id="ti-edit-theme-name" class="ti-control" data-modal-theme-name maxlength="80" value="${escapeHtml(modal.theme.name)}" autocomplete="off"><label class="ti-field-label ti-section-gap" for="ti-edit-theme-description">主题介绍</label><textarea id="ti-edit-theme-description" class="ti-control ti-modal-textarea" data-modal-theme-description maxlength="240">${escapeHtml(modal.theme.description || "")}</textarea><div class="ti-modal-actions"><button class="ti-button" type="button" data-modal-cancel>取消</button><button class="ti-button" data-primary="true" type="submit">保存</button></div></form></div>`;
     return `<div class="ti-modal-backdrop"><div class="ti-modal"><div class="ti-modal-title">未应用的修改</div><div class="ti-modal-copy">关闭前要应用当前主题修改吗？</div><div class="ti-modal-actions ti-modal-actions-split"><button class="ti-button" type="button" data-modal-cancel>继续编辑</button><button class="ti-button" type="button" data-modal-confirm="discard">放弃并关闭</button><button class="ti-button" data-primary="true" type="button" data-modal-confirm="apply">应用并关闭</button></div></div></div>`;
   }
 
@@ -1000,7 +1061,7 @@ ${customCss || ""}`;
     studioPreviewTimer = setTimeout(() => {
       studioPreviewTimer = 0;
       studioPreviewDeadline = 0;
-      if (!destroyed && studioOpen && studio?.isConnected) {
+      if (studioPreviewReady && !destroyed && studioOpen && studio?.isConnected) {
         applyTheme(draft, "");
         refreshStudioDom(studio, true);
         renderStudioDecorations(studio);
@@ -1014,24 +1075,37 @@ ${customCss || ""}`;
     const failedCount = progressItems.filter(item => item.status === "failed").length;
     const activeItems = progressItems.filter(item => item.status === "generating");
     const totalCount = progressItems.length;
-    const progressPercent = totalCount ? Math.round(completedCount / totalCount * 100) : aiGenerationProgress.state === "planning" ? 8 : 0;
-    const phase = generationPhase(aiGenerationProgress.state, aiGenerationProgress.message, activeItems, completedCount, totalCount, failedCount);
+    const settling = busy && ["completed", "finalizing"].includes(aiGenerationProgress.state);
+    const progressPercent = totalCount ? (settling ? Math.min(98, Math.round(completedCount / totalCount * 100)) : Math.round(completedCount / totalCount * 100)) : aiGenerationProgress.state === "planning" ? 8 : 0;
+    const phase = generationPhase(aiGenerationProgress.state, aiGenerationProgress.message, activeItems, completedCount, totalCount, failedCount, settling);
     const latestActivity = aiRequestLog.at(-1);
     const plans = aiResourcePlans.map((plan, index) => `<div class="ti-resource-item" data-status="configured"><div class="ti-resource-preview"></div><div class="ti-resource-info"><strong>${escapeHtml(resourceSlotLabel(plan.slot))}</strong><span title="${escapeHtml(plan.prompt)}">${escapeHtml(plan.prompt)}</span></div><button class="ti-icon-button" data-studio-remove-plan="${index}">删除</button></div>`).join("");
-    const progress = progressItems.map(item => { const previewUrl = thumbnailUrls.get(item.path) || item.previewUrl || ""; return `<div class="ti-resource-item" data-status="${escapeHtml(item.status)}"><div class="ti-resource-preview" data-empty="${!previewUrl}" style="${previewUrl ? `background-image:url(&quot;${escapeHtml(previewUrl)}&quot;)` : ""}"></div><div class="ti-resource-info"><strong>${escapeHtml(item.label || resourceSlotLabel(item.slot))}</strong><span title="${escapeHtml(item.message || item.prompt)}">${escapeHtml(item.message || item.prompt)}</span></div><div class="ti-resource-state">${escapeHtml(resourceStatusLabel(item.status))}</div></div>`; }).join("");
-    const reference = aiReferences.length ? `<div class="ti-reference-grid">${aiReferences.map((item, index) => `<div class="ti-ai-reference"><div class="ti-ai-reference-image" style="background-image:url(&quot;${escapeHtml(item.previewUrl)}&quot;)"></div><div><strong>${escapeHtml(item.path?.split("/").pop() || `参考图 ${index + 1}`)}</strong><span>参考图 ${index + 1}</span><button class="ti-button" type="button" data-studio-reference-remove="${index}">移除</button></div></div>`).join("")}</div>` : `<div class="ti-studio-empty">可选：添加参考图分析配色、氛围和层级。也可以 Ctrl+V 直接粘贴图片。</div>`;
+    const progress = progressItems.map(item => { const previewUrl = thumbnailUrls.get(item.path) || item.previewUrl || "", canGenerate = resourceSlotOptions.some(([slot]) => slot === item.slot), references = Array.isArray(item.referenceIndexes) && item.referenceIndexes.length ? ` · 参考图 ${item.referenceIndexes.join("、")}` : ""; return `<div class="ti-resource-item" data-status="${escapeHtml(item.status)}"><div class="ti-resource-preview" data-empty="${!previewUrl}" style="${previewUrl ? `background-image:url(&quot;${escapeHtml(previewUrl)}&quot;)` : ""}"></div><div class="ti-resource-info"><strong>${escapeHtml(item.label || resourceSlotLabel(item.slot))}</strong><span title="${escapeHtml(item.message || item.prompt)}">${escapeHtml(item.message || item.prompt)}${escapeHtml(references)}</span></div>${canGenerate ? `<button class="ti-button" data-studio-regenerate-resource="${escapeHtml(item.slot)}" data-resource-prompt="${escapeHtml(item.prompt)}" ${busy ? "disabled" : ""}>${item.status === "completed" ? "重新生成并覆盖" : "生成"}</button>` : `<div class="ti-resource-state">${escapeHtml(resourceStatusLabel(item.status))}</div>`}</div>`; }).join("");
+    const reference = `<div data-studio-reference-list>${studioReferenceListHtml()}</div>`;
     const logs = aiRequestLog.length ? aiRequestLog.slice().reverse().map(item => `<div class="ti-ai-log-item" data-outcome="${escapeHtml(item.outcome)}"><div><strong>${escapeHtml(item.stage)}</strong><span>${escapeHtml(item.model)} · ${item.httpStatus || "网络错误"} · ${item.durationMs} ms</span></div><code>${escapeHtml(item.endpoint)}</code>${item.message && item.message !== "请求成功" ? `<p>${escapeHtml(item.message)}</p>` : ""}</div>`).join("") : `<div class="ti-studio-empty">开始生成后，这里会实时显示蓝图和图片请求。</div>`;
     const decorations = draft?.skin?.decorations || [];
     const selected = decorations[studioSelectedDecoration];
     const decorationEditor = selected ? `<div class="ti-studio-form"><strong>装饰 ${studioSelectedDecoration + 1}</strong>${row("区域", `<select class="ti-control" data-studio-decoration-path="region"><option value="sidebar" ${selected.region === "sidebar" ? "selected" : ""}>侧边栏</option><option value="content" ${selected.region === "content" || selected.region === "titlebar" ? "selected" : ""}>内容区</option><option value="composer" ${selected.region === "composer" ? "selected" : ""}>输入区</option></select>`)}${row("锚点", `<select class="ti-control" data-studio-decoration-path="anchor"><option value="top-left" ${selected.anchor === "top-left" ? "selected" : ""}>左上</option><option value="top-right" ${selected.anchor === "top-right" ? "selected" : ""}>右上</option><option value="bottom-left" ${selected.anchor === "bottom-left" ? "selected" : ""}>左下</option><option value="bottom-right" ${selected.anchor === "bottom-right" ? "selected" : ""}>右下</option></select>`)}${row("水平偏移", `<input class="ti-control" type="number" min="-2000" max="2000" data-studio-decoration-path="offsetX" value="${selected.offsetX}">`)}${row("垂直偏移", `<input class="ti-control" type="number" min="-2000" max="2000" data-studio-decoration-path="offsetY" value="${selected.offsetY}">`)}${row("宽度", `<input class="ti-control" type="number" min="16" max="1600" data-studio-decoration-path="width" value="${selected.width}">`)}${row("透明度", `<input class="ti-control" type="range" min="0" max="1" step=".01" data-studio-decoration-path="opacity" value="${selected.opacity}">`)}</div>` : `<div class="ti-studio-empty">在预览中点击装饰，或从下方列表选择。</div>`;
-    return `<div class="ti-studio-backdrop"><div class="ti-studio-header"><div><div class="ti-studio-title">AI 主题生成工作台</div><div class="ti-studio-copy">需求、参考图、资源、日志与静态预览都在这里完成</div></div><div class="ti-inline"><button class="ti-button" data-studio-refresh>刷新 DOM 副本</button><button class="ti-button" data-studio-close ${busy ? "disabled title=\"生成完成后可关闭\"" : ""}>关闭</button></div></div><div class="ti-studio-main"><div class="ti-studio-canvas"><div class="ti-studio-frame-wrap"><iframe class="ti-studio-frame" sandbox="" title="Codex 静态 DOM 预览"></iframe><div class="ti-studio-decorations"></div></div></div><aside class="ti-studio-sidebar"><div class="ti-studio-tabs"><button class="ti-studio-tab" data-studio-tab="generate" data-active="${studioTab === "generate"}">生成</button><button class="ti-studio-tab" data-studio-tab="resources" data-active="${studioTab === "resources"}">资源</button><button class="ti-studio-tab" data-studio-tab="logs" data-active="${studioTab === "logs"}">日志</button><button class="ti-studio-tab" data-studio-tab="theme" data-active="${studioTab === "theme"}">主题</button><button class="ti-studio-tab" data-studio-tab="decorations" data-active="${studioTab === "decorations"}">装饰</button></div><div class="ti-studio-pane"><section data-studio-section="generate" data-active="${studioTab === "generate"}"><div class="ti-studio-form"><strong>主题需求</strong><textarea class="ti-control ti-ai-prompt" data-studio-prompt maxlength="6000" placeholder="描述主题风格、颜色、氛围、组件和使用场景" ${busy ? "disabled" : ""}>${escapeHtml(aiPrompt)}</textarea><div class="ti-section-title">参考图</div>${reference}<button class="ti-button" type="button" data-studio-reference-select ${busy ? "disabled" : ""}>选择参考图</button><label class="ti-ai-checkbox"><input type="checkbox" data-studio-generate-images ${aiGenerateImages ? "checked" : ""} ${busy ? "disabled" : ""}><span>生成背景、Hero、装饰和动作/卡片图标</span></label></div><div class="ti-generation-overview" data-state="${escapeHtml(aiGenerationProgress.state || "idle")}"><div class="ti-generation-phase"><strong>${escapeHtml(phase.title)}</strong><span>${escapeHtml(phase.detail)}</span>${latestActivity ? `<span class="ti-generation-activity">最近活动：${escapeHtml(latestActivity.stage)} · ${escapeHtml(latestActivity.outcome)}${latestActivity.httpStatus ? ` · HTTP ${latestActivity.httpStatus}` : ""}</span>` : ""}</div><div class="ti-progress-track"><span style="width:${progressPercent}%"></span></div><div class="ti-generation-counts"><span>${completedCount}/${totalCount || "—"} 已完成</span>${failedCount ? `<span>${failedCount} 失败</span>` : ""}</div></div>${activeItems.length ? `<div class="ti-section-title ti-section-gap">正在处理</div><div class="ti-resource-list">${activeItems.map(item => `<div class="ti-resource-item" data-status="generating"><div class="ti-resource-preview"></div><div class="ti-resource-info"><strong>${escapeHtml(item.label)}</strong><span>${escapeHtml(item.prompt)}</span></div><div class="ti-resource-state">生成中</div></div>`).join("")}</div>` : ""}</section><section data-studio-section="resources" data-active="${studioTab === "resources"}"><form class="ti-studio-form" data-studio-plan-form><strong>添加资源配置</strong><select class="ti-control" data-studio-plan-slot>${resourceSlotOptions.map(([value, label]) => `<option value="${value}">${label}</option>`).join("")}</select><textarea class="ti-control" data-studio-plan-prompt maxlength="2000" placeholder="描述这个资源的构图、颜色、留白和用途"></textarea><button class="ti-button" data-primary="true" type="submit">添加到生成计划</button></form><div class="ti-section-title">自定义计划</div><div class="ti-resource-list">${plans || `<div class="ti-studio-empty">尚未添加自定义资源，AI 仍会按蓝图生成默认资源。</div>`}</div><div class="ti-section-title ti-section-gap">全部资源 · ${completedCount}/${totalCount || "—"}</div><div class="ti-resource-list">${progress || `<div class="ti-studio-empty">开始生成后逐项显示状态。</div>`}</div></section><section data-studio-section="logs" data-active="${studioTab === "logs"}"><div class="ti-section-title">实时请求日志 · ${aiRequestLog.length}</div><div class="ti-ai-log">${logs}</div></section><section data-studio-section="theme" data-active="${studioTab === "theme"}"><div class="ti-studio-form"><strong>快速主题配置</strong>${row("内容背景", colorInput("tokens.contentBackground", draft.tokens.contentBackground))}${row("主要文字", colorInput("tokens.foreground", draft.tokens.foreground))}${row("强调色", colorInput("tokens.accent", draft.tokens.accent))}${row("圆角", rangeInput("shape.radius", draft.shape.radius, 0, 40, 1))}${row("侧栏宽度", numberInput("layout.sidebarWidth", draft.layout.sidebarWidth, 180, 520))}</div></section><section data-studio-section="decorations" data-active="${studioTab === "decorations"}">${decorationEditor}<div class="ti-resource-list">${decorations.map((item, index) => `<button class="ti-resource-item" data-studio-select-decoration="${index}" data-status="${index === studioSelectedDecoration ? "completed" : "configured"}"><span class="ti-resource-preview" style="background-image:url(&quot;${escapeHtml(resolvedAsset(draft, item.asset))}&quot;)"></span><span class="ti-resource-info"><strong>装饰 ${index + 1}</strong><span>${escapeHtml(item.region)} · ${item.offsetX}, ${item.offsetY}</span></span></button>`).join("") || `<div class="ti-studio-empty">先生成或添加装饰层。</div>`}</div></section></div><div class="ti-studio-footer"><div><strong>${escapeHtml(phase.title)}</strong><span class="ti-studio-copy">${escapeHtml(phase.footer)}</span></div><button class="ti-button" data-primary="true" data-studio-generate ${busy ? "disabled" : ""}>${busy ? `${progressPercent}% 生成中` : "开始生成"}</button></div></aside></div></div>`;
+    return `<div class="ti-studio-backdrop"><div class="ti-studio-header"><div><div class="ti-studio-title">AI 主题生成工作台</div><div class="ti-studio-copy">需求、参考图、资源、日志与静态预览都在这里完成</div></div><div class="ti-inline"><button class="ti-button" data-studio-refresh>刷新 DOM 副本</button><button class="ti-button" data-studio-close ${busy ? "disabled title=\"生成完成后可关闭\"" : ""}>关闭</button></div></div><div class="ti-studio-main"><div class="ti-studio-canvas"><div class="ti-studio-frame-wrap"><iframe class="ti-studio-frame" sandbox="allow-same-origin" referrerpolicy="no-referrer" title="Codex 静态 DOM 预览"></iframe><div class="ti-studio-decorations"></div></div></div><aside class="ti-studio-sidebar"><div class="ti-studio-tabs"><button class="ti-studio-tab" data-studio-tab="generate" data-active="${studioTab === "generate"}">生成</button><button class="ti-studio-tab" data-studio-tab="resources" data-active="${studioTab === "resources"}">资源</button><button class="ti-studio-tab" data-studio-tab="logs" data-active="${studioTab === "logs"}">日志</button><button class="ti-studio-tab" data-studio-tab="theme" data-active="${studioTab === "theme"}">主题</button><button class="ti-studio-tab" data-studio-tab="decorations" data-active="${studioTab === "decorations"}">装饰</button></div><div class="ti-studio-pane"><section data-studio-section="generate" data-active="${studioTab === "generate"}"><div class="ti-studio-form"><strong>主题需求</strong><textarea class="ti-control ti-ai-prompt" data-studio-prompt maxlength="6000" placeholder="描述主题风格、颜色、氛围、组件和使用场景" ${busy ? "disabled" : ""}>${escapeHtml(aiPrompt)}</textarea><div class="ti-section-title">参考图</div>${reference}<button class="ti-button" type="button" data-studio-reference-select ${busy ? "disabled" : ""}>选择参考图</button><label class="ti-ai-checkbox"><input type="checkbox" data-studio-generate-images ${aiGenerateImages ? "checked" : ""} ${busy ? "disabled" : ""}><span>生成背景、Hero、装饰和动作/卡片图标</span></label></div><div class="ti-generation-overview" data-state="${escapeHtml(aiGenerationProgress.state || "idle")}"><div class="ti-generation-phase"><strong>${escapeHtml(phase.title)}</strong><span>${escapeHtml(phase.detail)}</span>${latestActivity ? `<span class="ti-generation-activity">最近活动：${escapeHtml(latestActivity.stage)} · ${escapeHtml(latestActivity.outcome)}${latestActivity.httpStatus ? ` · HTTP ${latestActivity.httpStatus}` : ""}</span>` : ""}</div><div class="ti-progress-track"><span style="width:${progressPercent}%"></span></div><div class="ti-generation-counts"><span>${completedCount}/${totalCount || "—"} 已完成</span>${failedCount ? `<span>${failedCount} 失败</span>` : ""}</div></div>${activeItems.length ? `<div class="ti-section-title ti-section-gap">正在处理</div><div class="ti-resource-list">${activeItems.map(item => `<div class="ti-resource-item" data-status="generating"><div class="ti-resource-preview"></div><div class="ti-resource-info"><strong>${escapeHtml(item.label)}</strong><span>${escapeHtml(item.prompt)}</span></div><div class="ti-resource-state">生成中</div></div>`).join("")}</div>` : ""}</section><section data-studio-section="resources" data-active="${studioTab === "resources"}"><form class="ti-studio-form" data-studio-plan-form><strong>添加资源配置</strong><select class="ti-control" data-studio-plan-slot>${resourceSlotOptions.map(([value, label]) => `<option value="${value}">${label}</option>`).join("")}</select><textarea class="ti-control" data-studio-plan-prompt maxlength="2000" placeholder="描述这个资源的构图、颜色、留白和用途"></textarea><button class="ti-button" data-primary="true" type="submit">添加到生成计划</button></form><div class="ti-section-title">自定义计划</div><div class="ti-resource-list">${plans || `<div class="ti-studio-empty">尚未添加自定义资源，AI 仍会按蓝图生成默认资源。</div>`}</div><div class="ti-section-title ti-section-gap">全部资源 · ${completedCount}/${totalCount || "—"}</div><div class="ti-resource-list">${progress || `<div class="ti-studio-empty">开始生成后逐项显示状态。</div>`}</div></section><section data-studio-section="logs" data-active="${studioTab === "logs"}"><div class="ti-section-title">实时请求日志 · ${aiRequestLog.length}</div><div class="ti-ai-log">${logs}</div></section><section data-studio-section="theme" data-active="${studioTab === "theme"}"><div class="ti-studio-form"><strong>快速主题配置</strong>${row("内容背景", colorInput("tokens.contentBackground", draft.tokens.contentBackground))}${row("主要文字", colorInput("tokens.foreground", draft.tokens.foreground))}${row("强调色", colorInput("tokens.accent", draft.tokens.accent))}${row("圆角", rangeInput("shape.radius", draft.shape.radius, 0, 40, 1))}${row("侧栏宽度", numberInput("layout.sidebarWidth", draft.layout.sidebarWidth, 180, 520))}</div></section><section data-studio-section="decorations" data-active="${studioTab === "decorations"}">${decorationEditor}<div class="ti-resource-list">${decorations.map((item, index) => `<button class="ti-resource-item" data-studio-select-decoration="${index}" data-status="${index === studioSelectedDecoration ? "completed" : "configured"}"><span class="ti-resource-preview" style="background-image:url(&quot;${escapeHtml(resolvedAsset(draft, item.asset))}&quot;)"></span><span class="ti-resource-info"><strong>装饰 ${index + 1}</strong><span>${escapeHtml(item.region)} · ${item.offsetX}, ${item.offsetY}</span></span></button>`).join("") || `<div class="ti-studio-empty">先生成或添加装饰层。</div>`}</div></section></div><div class="ti-studio-footer"><div><strong>${escapeHtml(phase.title)}</strong><span class="ti-studio-copy">${escapeHtml(phase.footer)}</span></div><button class="ti-button" data-primary="true" data-studio-generate ${busy ? "disabled" : ""}>${busy ? `${progressPercent}% 生成中` : "开始生成"}</button></div></aside></div></div>`;
   }
 
   function resourceSlotLabel(slot) { return resourceSlotOptions.find(([value]) => value === slot)?.[1] || slot; }
   function resourceStatusLabel(status) { return ({ queued:"等待", generating:"生成中", completed:"已完成", failed:"失败" })[status] || status; }
-  function generationPhase(state, message, active, completed, total, failed) {
+  function studioReferenceListHtml() {
+    return aiReferences.length ? `<div class="ti-reference-grid">${aiReferences.map((item, index) => { const loading = item.previewState === "loading"; const failed = item.previewState === "failed"; return `<div class="ti-ai-reference"><div class="ti-ai-reference-image" data-loading="${loading}" data-failed="${failed}" style="${item.previewUrl ? `background-image:url(&quot;${escapeHtml(item.previewUrl)}&quot;)` : ""}"></div><div><strong>${escapeHtml(item.path?.split("/").pop() || `参考图 ${index + 1}`)}</strong><span>${loading ? "正在读取预览…" : failed ? "预览读取失败，生成时仍会使用原图" : `参考图 ${index + 1}`}</span><button class="ti-button" type="button" data-studio-reference-remove="${index}">移除</button></div></div>`; }).join("")}</div>` : `<div class="ti-studio-empty">可选：添加参考图分析配色、氛围和层级。也可以 Ctrl+V 直接粘贴图片。</div>`;
+  }
+
+  function refreshStudioReferenceList() {
+    const host = document.querySelector("[data-studio-reference-list]");
+    if (!host) return;
+    host.innerHTML = studioReferenceListHtml();
+    host.querySelectorAll("[data-studio-reference-remove]").forEach(button => button.addEventListener("click", () => void removeAiReference(Number(button.dataset.studioReferenceRemove))));
+  }
+
+  function generationPhase(state, message, active, completed, total, failed, settling = false) {
+    if (settling || state === "finalizing") return { title:"正在整理生成结果", detail:message || "图片资源已完成，正在整理预览和草稿，马上就好。", footer:"正在收尾，不会重复生成图片" };
     if (state === "planning") return { title:"正在分析主题需求", detail:message || "基础/视觉模型正在生成主题蓝图，资源清单将在蓝图完成后出现。", footer:"主题蓝图分析中" };
-    if (state === "generating") return { title:active.length ? `正在生成：${active.map(item => item.label).join("、")}` : "正在调度图片资源", detail:message ? `${message}；已完成 ${completed}/${total}` : `已完成 ${completed}/${total}，图片并发 2；失败资源会显示原因并保留已完成结果。`, footer:`图片资源 ${completed}/${total}` };
+    if (state === "generating") return { title:active.length ? `正在生成：${active.map(item => item.label).join("、")}` : "正在调度图片资源", detail:message ? `${message}；已完成 ${completed}/${total}` : `已完成 ${completed}/${total}，最多 4 路并发；预览 DOM 会在收尾后单独刷新。`, footer:`图片资源 ${completed}/${total}` };
     if (state === "completed") return { title:"主题生成完成", detail:total ? `${completed}/${total} 个图片资源已完成，可继续调整主题和装饰。` : (message || "主题蓝图已生成，可继续调整主题。"), footer:"可以继续预览和调整" };
     if (state === "failed") return { title:"生成未完整完成", detail:`已完成 ${completed}/${total}，失败 ${failed}；查看资源和日志了解原因。`, footer:"查看日志后可再次生成续跑" };
     return { title:"等待开始生成", detail:"填写主题需求，可选参考图和自定义资源，然后开始生成。", footer:"预览无实际功能，修改只进入草稿" };
@@ -1043,18 +1117,49 @@ ${customCss || ""}`;
     if (id === "colors") return colorsHtml();
     if (id === "background") return backgroundHtml();
     if (id === "type") return `<div class="ti-card">${row("界面字体", textInput("typography.uiFont", draft.typography.uiFont))}${row("代码字体", textInput("typography.monoFont", draft.typography.monoFont))}${row("字号比例", rangeInput("typography.scale", draft.typography.scale, .8, 1.4, .01))}${row("行高", rangeInput("typography.lineHeight", draft.typography.lineHeight, 1.1, 2, .05))}</div>`;
-    if (id === "layout") return `<div class="ti-card">${row("密度", rangeInput("layout.density", draft.layout.density, .75, 1.35, .01))}${row("侧边栏宽度", numberInput("layout.sidebarWidth", draft.layout.sidebarWidth, 180, 520))}${row("内容最大宽度", numberInput("layout.contentMaxWidth", draft.layout.contentMaxWidth, 480, 2400))}</div>`;
     if (id === "effects") return `<div class="ti-card">${row("圆角", rangeInput("shape.radius", draft.shape.radius, 0, 40, 1))}${row("边框宽度", rangeInput("shape.borderWidth", draft.shape.borderWidth, 0, 4, 1))}${row("浮层透明度", rangeInput("effects.panelOpacity", draft.effects.panelOpacity, .25, 1, .01))}${row("全局模糊", rangeInput("effects.backgroundBlur", draft.effects.backgroundBlur, 0, 80, 1))}${row("全局饱和度", rangeInput("effects.saturation", draft.effects.saturation, .5, 2, .05))}${row("阴影强度", rangeInput("effects.shadowStrength", draft.effects.shadowStrength, 0, 1, .05))}</div>`;
     if (id === "terminal") return terminalHtml();
     if (id === "skin") return skinHtml();
     if (id === "ai") return aiHtml();
-    if (id === "advanced") return `<div class="ti-notice">自定义 CSS 可以隐藏或伪造页面内容。只有你完全信任的本地主题才应启用。</div><label class="ti-inline" style="margin:12px 0"><input type="checkbox" data-custom-css-enabled ${state.customCssTrusted ? "checked" : ""}>启用并信任自定义 CSS</label><textarea class="ti-textarea" data-custom-css spellcheck="false" placeholder="/* 自定义 CSS */">${escapeHtml(draftCustomCss)}</textarea>`;
+    if (id === "advanced") return advancedHtml();
     return "";
   }
 
+  function advancedHtml() {
+    const appearance = triggerAppearanceDraft || state.settings?.triggerAppearance || { shape:"rounded", size:40, right:18, bottom:18, backgroundOpacity:.88, shadowStrength:.35 };
+    return `<details class="ti-card ti-config-card" open><summary>右下角入口</summary><div class="ti-trigger-preview"><span style="${triggerStyle(appearance)}"><img src="${escapeHtml(state.triggerIcon || TOOLBAR_ICON)}" alt=""></span><div><strong>入口预览</strong><div class="ti-description">标题中的品牌水印固定不变；这里只调整右下角入口。</div></div></div>${row("形状", `<select class="ti-control" data-trigger-setting="shape"><option value="rounded" ${appearance.shape === "rounded" ? "selected" : ""}>圆角方形</option><option value="circle" ${appearance.shape === "circle" ? "selected" : ""}>圆形</option><option value="square" ${appearance.shape === "square" ? "selected" : ""}>方形</option></select>`)}${triggerRangeRow("尺寸", "size", appearance.size, 32, 72, 1)}${triggerRangeRow("右侧距离", "right", appearance.right, 0, 160, 1)}${triggerRangeRow("底部距离", "bottom", appearance.bottom, 0, 160, 1)}${triggerRangeRow("背景透明度", "backgroundOpacity", appearance.backgroundOpacity, .35, 1, .01)}${triggerRangeRow("阴影强度", "shadowStrength", appearance.shadowStrength, 0, 1, .01)}<div class="ti-action-group"><button class="ti-button" type="button" data-trigger-icon-import>选择自定义图标</button>${state.triggerIcon ? `<button class="ti-button" type="button" data-trigger-icon-reset>恢复默认图标</button>` : ""}<button class="ti-button" data-primary="true" type="button" data-trigger-save>保存入口设置</button></div></details><div class="ti-notice ti-section-gap"><strong>如何捕捉 CSS 位置</strong><ol class="ti-css-guide"><li>按 F12 或 Ctrl+Shift+I 打开开发者工具。</li><li>按 Ctrl+Shift+C 后点击要修改的位置。</li><li>在 Elements 面板右键节点，选择 Copy → Copy selector，再粘贴到下方。</li></ol><button class="ti-button ti-section-gap" type="button" data-css-inspector>直接在页面捕捉元素</button><div class="ti-description" data-css-selector-output>也可点击上方按钮，再点击 Codex 页面中的目标位置，选择器会自动写入 CSS。</div></div><div class="ti-notice ti-section-gap">自定义 CSS 可以隐藏或伪造页面内容。只有你完全信任的本地主题才应启用。</div><label class="ti-inline" style="margin:12px 0"><input type="checkbox" data-custom-css-enabled ${state.customCssTrusted ? "checked" : ""}>启用并信任自定义 CSS</label><textarea class="ti-textarea" data-custom-css spellcheck="false" placeholder="/* 示例：粘贴捕捉到的选择器 */&#10;.your-selector {&#10;  /* 在此添加样式 */&#10;}">${escapeHtml(draftCustomCss)}</textarea>`;
+  }
+
+  function triggerRangeRow(label, key, value, min, max, step) { return row(label, `<div class="ti-inline"><input class="ti-control" type="range" data-trigger-setting="${key}" value="${value}" min="${min}" max="${max}" step="${step}"><output>${rangeValue(value, step)}</output></div>`); }
+  function triggerStyle(appearance) { const radius = appearance.shape === "circle" ? "50%" : appearance.shape === "square" ? "4px" : "12px"; return `width:${appearance.size}px;height:${appearance.size}px;border-radius:${radius};background:color-mix(in srgb,var(--ti-elevated) ${Math.round(appearance.backgroundOpacity * 100)}%,transparent);box-shadow:0 8px 24px rgba(0,0,0,${(.36 * appearance.shadowStrength).toFixed(2)})`; }
+
   function libraryHtml() {
     const actions = `<div class="ti-inline" style="margin-bottom:10px;flex-wrap:wrap"><button class="ti-button" data-action="create">新建主题</button><button class="ti-button" data-action="import">安装 ZIP</button><button class="ti-button" data-action="open-ai">AI 生成主题</button></div>`;
-    return `<div class="ti-notice" style="margin-bottom:10px">皮肤是主题包的一部分。导出 ZIP 会包含颜色、背景、品牌、组件表面、图标、欢迎页以及主题目录中的本地图片资源；API Key 不会导出。</div>${actions}<div class="ti-grid">${state.themes.map(theme => { const mode = theme.skin?.enabled ? "高级皮肤" : theme.background?.mode === "per-region" ? "分区背景" : activeBackgrounds(theme).some(([, background]) => hasBackground(background)) ? "全屏背景" : ""; return `<div class="ti-card ti-theme-card" data-theme-id="${escapeHtml(theme.id)}" data-selected="${theme.id === draft.id}"><div class="ti-swatch" style="background:linear-gradient(135deg,${theme.tokens.sidebarBackground},${theme.tokens.accent})"></div><div><div class="ti-name">${escapeHtml(theme.name)}${mode ? `<span class="ti-badge">${mode}</span>` : ""}</div><div class="ti-description">${escapeHtml(theme.description || theme.id)}</div></div><button class="ti-icon-button" data-export="${escapeHtml(theme.id)}">导出</button></div>`; }).join("")}</div><div class="ti-inline" style="margin-top:10px"><button class="ti-button" data-action="clone">复制当前</button><button class="ti-button" data-action="delete">删除当前</button></div>`;
+    const cards = state.themes.map(theme => {
+      const mode = theme.skin?.enabled ? "高级皮肤" : theme.background?.mode === "per-region" ? "分区背景" : activeBackgrounds(theme).some(([, background]) => hasBackground(background)) ? "全屏背景" : "";
+      return `<div class="ti-card ti-theme-card" data-theme-activate="${escapeHtml(theme.id)}" data-selected="${theme.id === draft.id}">${themeCardThumbnailHtml(theme)}<div><div class="ti-name">${escapeHtml(theme.name)}${mode ? `<span class="ti-badge">${mode}</span>` : ""}</div><div class="ti-description">${escapeHtml(theme.description || theme.id)}</div></div><details class="ti-theme-menu"><summary title="主题操作" aria-label="主题操作">•••</summary><div class="ti-theme-menu-popover"><button type="button" data-theme-edit="${escapeHtml(theme.id)}">编辑名称和介绍</button><button type="button" data-export="${escapeHtml(theme.id)}">导出主题</button><button type="button" data-theme-delete="${escapeHtml(theme.id)}" ${theme.id.startsWith("builtin.") ? "disabled title=\"内置主题不能删除\"" : ""}>删除主题</button></div></details></div>`;
+    }).join("");
+    return `<div class="ti-notice" style="margin-bottom:10px">点击主题卡片即可切换；右侧菜单可编辑名称和介绍、导出或删除主题。</div>${actions}<div class="ti-grid">${cards}</div><div class="ti-inline" style="margin-top:10px"><button class="ti-button" data-action="clone">复制当前</button></div>`;
+  }
+
+  function themeCardThumbnailHtml(theme) {
+    const fallback = `linear-gradient(135deg,${theme.tokens.sidebarBackground},${theme.tokens.accent})`;
+    const heroPath = theme.skin?.resources?.heroImage;
+    if (heroPath) {
+      const key = `${theme.id}:${heroPath}`;
+      const thumbnailUrl = themeThumbnailUrls.get(key) || "";
+      return `<div class="ti-swatch ti-theme-thumbnail" data-loading="${!thumbnailUrl}" data-thumbnail-key="${escapeHtml(key)}" data-theme-id="${escapeHtml(theme.id)}" data-theme-hero="${escapeHtml(heroPath)}" style="background:${fallback}"><img ${thumbnailUrl ? `src="${escapeHtml(thumbnailUrl)}"` : ""} alt="" loading="lazy"></div>`;
+    }
+    const backgrounds = theme.background?.mode === "per-region"
+      ? [theme.background?.content, theme.background?.sidebar, theme.background?.fullscreen]
+      : [theme.background?.fullscreen, theme.background?.content, theme.background?.sidebar];
+    const background = backgrounds.find(item => item?.kind === "image" && item.path);
+    const path = background?.path;
+    if (!path) return `<div class="ti-swatch" style="background:${fallback}"></div>`;
+    const url = resolvedAsset(theme, path);
+    const positionX = Number.isFinite(background?.positionX) ? background.positionX : 50;
+    const positionY = Number.isFinite(background?.positionY) ? background.positionY : 50;
+    return `<div class="ti-swatch ti-theme-thumbnail" data-loading="true" style="background:${fallback}"><img src="${escapeHtml(url)}" alt="" loading="lazy" data-fit="cover" style="object-position:${positionX}% ${positionY}%"></div>`;
   }
 
   function colorsHtml() {
@@ -1136,7 +1241,7 @@ ${customCss || ""}`;
     const settings = aiSettings || state.ai || { baseUrl: "https://api.openai.com/v1", imageBaseUrl: "", textModel: "gpt-4.1-mini", visionModel: "gpt-4.1-mini", imageModel: "gpt-image-1", imageSize: "3:2", hasApiKey: false, hasImageApiKey: false };
     const baseKeyState = settings.hasApiKey ? "基础 Key 已使用 Windows 当前用户加密保存" : "基础 Key 尚未保存";
     const imageKeyState = settings.hasImageApiKey ? "生图 Key 已使用 Windows 当前用户加密保存" : "生图 Key 尚未保存";
-    return `<div class="ti-notice">主题需求、参考图、资源计划、生成进度和日志已统一放入生成工作台。此处只管理连接设置。</div><details class="ti-card ti-config-card" open><summary>连接设置 <span class="ti-badge">${settings.hasApiKey ? "基础已配置" : "基础未配置"}</span></summary>${row("基础 API 地址", `<input class="ti-control" type="url" data-ai-setting="baseUrl" value="${escapeHtml(settings.baseUrl)}" placeholder="http://192.168.1.16:8080/v1 或 https://api.openai.com/v1">`)}${row("基础 Key", `<input class="ti-control" type="password" data-ai-api-key value="${escapeHtml(aiApiKeyDraft)}" placeholder="${settings.hasApiKey ? "留空则继续使用已保存的基础 Key" : "输入基础/视觉模型使用的 Key"}" autocomplete="new-password">`)}<div class="ti-secret-status">${baseKeyState}。基础地址允许 HTTP/HTTPS。</div>${row("基础模型", `<input class="ti-control" data-ai-setting="textModel" value="${escapeHtml(settings.textModel)}" placeholder="gpt-4.1-mini">`)}${row("视觉模型", `<input class="ti-control" data-ai-setting="visionModel" value="${escapeHtml(settings.visionModel)}" placeholder="支持图片输入的模型名称">`)}${row("生图 API 地址", `<input class="ti-control" type="url" data-ai-setting="imageBaseUrl" value="${escapeHtml(settings.imageBaseUrl || "")}" placeholder="http://192.168.1.16:8080 或留空">`)}${row("生图 Key", `<input class="ti-control" type="password" data-ai-image-api-key value="${escapeHtml(aiImageApiKeyDraft)}" placeholder="${settings.hasImageApiKey ? "留空则继续使用已保存的生图 Key" : "输入生图模型单独使用的 Key"}" autocomplete="new-password">`)}<div class="ti-secret-status">${imageKeyState}。生图地址允许 HTTP/HTTPS，留空时自动使用基础地址；密钥不会进入日志或主题 ZIP。</div>${row("生图模型", `<input class="ti-control" data-ai-setting="imageModel" value="${escapeHtml(settings.imageModel)}" placeholder="gpt-image-1">`)}${row("图片比例", `<input class="ti-control" data-ai-setting="imageSize" value="${escapeHtml(settings.imageSize)}" placeholder="3:2 或 16:9">`)}<div class="ti-inline ti-section-gap ti-modal-actions-split"><button class="ti-button" type="button" data-ai-settings-save>保存连接设置</button>${settings.hasApiKey ? `<button class="ti-button" type="button" data-ai-key-clear>清除基础 Key</button>` : ""}${settings.hasImageApiKey ? `<button class="ti-button" type="button" data-ai-image-key-clear>清除生图 Key</button>` : ""}</div></details><button class="ti-button ti-ai-generate" data-primary="true" type="button" data-ai-workbench>打开 AI 生成工作台</button><div class="ti-description">在工作台内填写需求、添加参考图、查看每项资源与实时日志。</div>`;
+    return `<div class="ti-notice">主题需求、参考图、资源计划、生成进度和日志已统一放入生成工作台。此处只管理连接设置。</div><details class="ti-card ti-config-card" open><summary>连接设置 <span class="ti-badge">${settings.hasApiKey ? "基础已配置" : "基础未配置"}</span></summary>${row("基础 API 地址", `<input class="ti-control" type="url" data-ai-setting="baseUrl" value="${escapeHtml(settings.baseUrl)}" placeholder="https://api.openai.com/v1">`)}${row("基础 Key", `<input class="ti-control" type="password" data-ai-api-key value="${escapeHtml(aiApiKeyDraft)}" placeholder="${settings.hasApiKey ? "留空则继续使用已保存的基础 Key" : "输入基础/视觉模型使用的 Key"}" autocomplete="new-password">`)}<div class="ti-secret-status">${baseKeyState}。基础地址允许 HTTP/HTTPS。</div>${row("基础模型", `<input class="ti-control" data-ai-setting="textModel" value="${escapeHtml(settings.textModel)}" placeholder="gpt-4.1-mini">`)}${row("视觉模型", `<input class="ti-control" data-ai-setting="visionModel" value="${escapeHtml(settings.visionModel)}" placeholder="支持图片输入的模型名称">`)}${row("生图 API 地址", `<input class="ti-control" type="url" data-ai-setting="imageBaseUrl" value="${escapeHtml(settings.imageBaseUrl || "")}" placeholder="">`)}${row("生图 Key", `<input class="ti-control" type="password" data-ai-image-api-key value="${escapeHtml(aiImageApiKeyDraft)}" placeholder="${settings.hasImageApiKey ? "留空则继续使用已保存的生图 Key" : "输入生图模型单独使用的 Key"}" autocomplete="new-password">`)}<div class="ti-secret-status">${imageKeyState}。生图地址允许 HTTP/HTTPS，留空时自动使用基础地址；密钥不会进入日志或主题 ZIP。</div>${row("生图模型", `<input class="ti-control" data-ai-setting="imageModel" value="${escapeHtml(settings.imageModel)}" placeholder="gpt-image-1">`)}${row("图片比例", `<input class="ti-control" data-ai-setting="imageSize" value="${escapeHtml(settings.imageSize)}" placeholder="3:2 或 16:9">`)}<div class="ti-inline ti-section-gap ti-modal-actions-split"><button class="ti-button" type="button" data-ai-settings-save>保存连接设置</button>${settings.hasApiKey ? `<button class="ti-button" type="button" data-ai-key-clear>清除基础 Key</button>` : ""}${settings.hasImageApiKey ? `<button class="ti-button" type="button" data-ai-image-key-clear>清除生图 Key</button>` : ""}</div></details><button class="ti-button ti-ai-generate" data-primary="true" type="button" data-ai-workbench>打开 AI 生成工作台</button><div class="ti-description">在工作台内填写需求、添加参考图、查看每项资源与实时日志。</div>`;
   }
 
   function row(label, control) { return `<div class="ti-row"><div class="ti-label">${label}</div><div>${control}</div></div>`; }
@@ -1165,9 +1270,22 @@ ${customCss || ""}`;
       body.addEventListener("scroll", () => { panelScrollTop = body.scrollTop; }, { passive: true });
     }
     if (modal?.kind === "create") queueMicrotask(() => panel.querySelector("[data-modal-name]")?.select());
+    if (modal?.kind === "edit-theme") queueMicrotask(() => panel.querySelector("[data-modal-theme-name]")?.select());
   }
 
   function bindPanel(panel) {
+    panel.querySelectorAll(".ti-theme-thumbnail img").forEach(image => {
+      const thumbnail = image.parentElement;
+      const settle = loaded => {
+        thumbnail.dataset.loading = "false";
+        thumbnail.dataset.loaded = String(loaded);
+        image.hidden = !loaded;
+      };
+      image.addEventListener("load", () => settle(true), { once:true });
+      image.addEventListener("error", () => settle(false), { once:true });
+      if (image.hasAttribute("src") && image.complete) settle(image.naturalWidth > 0);
+    });
+    panel.querySelectorAll(".ti-theme-thumbnail[data-theme-hero]").forEach(thumbnail => void loadThemeThumbnail(thumbnail));
     panel.querySelectorAll("[data-tab]").forEach(button => button.onclick = () => { activeTab = button.dataset.tab; renderPanel(); });
     panel.querySelector('[data-action="close"]')?.addEventListener("click", closePanel);
     panel.querySelector('[data-action="reinject"]')?.addEventListener("click", () => void runAction("正在重新注入…", () => call("runtime.reinject"), "重新注入请求已发送"));
@@ -1177,14 +1295,35 @@ ${customCss || ""}`;
     panel.querySelector('[data-action="create"]')?.addEventListener("click", () => { modal = { kind: "create", defaultValue: `${draft.name} 自定义` }; renderPanel(); });
     panel.querySelector('[data-action="open-ai"]')?.addEventListener("click", () => { activeTab = "ai"; renderPanel(); });
     panel.querySelector('[data-action="clone"]')?.addEventListener("click", () => void runAction("正在复制主题…", async () => { draft = await call("theme.package.clone", { id: draft.id }); dirty = true; await hydrateAssets(draft); applyTheme(draft, draftCustomCss); await reloadThemes(); }, "副本已创建，点击应用以保存"));
-    panel.querySelector('[data-action="delete"]')?.addEventListener("click", () => { if (draft.id.startsWith("builtin.")) { setStatus("内置主题不能删除", "error"); return; } modal = { kind: "delete" }; renderPanel(); });
-    panel.querySelectorAll("[data-theme-id]").forEach(card => card.onclick = event => { if (event.target.closest("[data-export]")) return; void runAction("正在切换主题…", async () => { await cancelStaging(); state = await call("theme.activate", { id: card.dataset.themeId }); draft = clone(state.activeTheme); snapshot = clone(state.activeTheme); draftCustomCss = state.customCss || ""; dirty = false; await hydrateAssets(draft); applyTheme(draft, state.customCssTrusted ? draftCustomCss : ""); }, "主题已切换并保存"); });
+    panel.querySelectorAll("[data-theme-activate]").forEach(card => card.onclick = event => { if (event.target.closest("details,button")) return; if (card.dataset.themeActivate === draft.id) return; void runAction("正在切换主题…", async () => { await cancelStaging(); state = await call("theme.activate", { id: card.dataset.themeActivate }); draft = clone(state.activeTheme); snapshot = clone(state.activeTheme); draftCustomCss = state.customCss || ""; dirty = false; await hydrateAssets(draft); applyTheme(draft, state.customCssTrusted ? draftCustomCss : ""); }, "主题已切换并保存"); });
+    panel.querySelectorAll(".ti-theme-menu").forEach(menu => menu.onclick = event => event.stopPropagation());
+    panel.querySelectorAll(".ti-theme-menu > summary").forEach(summary => summary.addEventListener("click", () => {
+      const currentMenu = summary.parentElement;
+      panel.querySelectorAll(".ti-theme-menu[open]").forEach(menu => { if (menu !== currentMenu) menu.open = false; });
+      setTimeout(() => {
+        if (!currentMenu.open) return;
+        const popover = currentMenu.querySelector(".ti-theme-menu-popover");
+        if (!popover) return;
+        const summaryRect = summary.getBoundingClientRect();
+        const panelRect = panel.getBoundingClientRect();
+        const width = 168;
+        const left = Math.max(8, Math.min(summaryRect.right - width - panelRect.left, panelRect.width - width - 8));
+        const top = Math.max(8, summaryRect.bottom - panelRect.top + 6);
+        popover.style.left = `${left}px`;
+        popover.style.top = `${top}px`;
+      }, 0);
+    }));
+    panel.querySelector(".ti-body")?.addEventListener("scroll", () => panel.querySelectorAll(".ti-theme-menu[open]").forEach(menu => { menu.open = false; }), { passive: true });
+    panel.addEventListener("click", event => { if (event.target.closest(".ti-theme-menu")) return; panel.querySelectorAll(".ti-theme-menu[open]").forEach(menu => { menu.open = false; }); });
+    panel.querySelectorAll("[data-theme-edit]").forEach(button => button.onclick = event => { event.stopPropagation(); const theme = state.themes.find(item => item.id === button.dataset.themeEdit); if (theme) { modal = { kind:"edit-theme", theme:clone(theme) }; renderPanel(); } });
+    panel.querySelectorAll("[data-theme-delete]").forEach(button => button.onclick = event => { event.stopPropagation(); if (button.disabled) return; const theme = state.themes.find(item => item.id === button.dataset.themeDelete); if (theme) { modal = { kind:"delete", theme:clone(theme) }; renderPanel(); } });
     panel.querySelectorAll("[data-export]").forEach(button => button.onclick = event => { event.stopPropagation(); void runAction("等待选择导出位置…", () => call("theme.package.export", { id: button.dataset.export }), "主题已导出"); });
     panel.querySelector("[data-modal-cancel]")?.addEventListener("click", () => { modal = null; renderPanel(); });
     panel.querySelector('[data-modal-form="create"]')?.addEventListener("submit", event => { event.preventDefault(); const name = panel.querySelector("[data-modal-name]")?.value.trim(); if (!name) { setStatus("请输入主题名称", "error"); return; } void runAction("正在创建主题…", async () => { const theme = await call("theme.package.create", { sourceId: draft.id, name }); state = await call("theme.activate", { id: theme.id }); draft = clone(state.activeTheme); snapshot = clone(state.activeTheme); draftCustomCss = state.customCss || ""; dirty = false; modal = null; await hydrateAssets(draft); applyTheme(draft, state.customCssTrusted ? draftCustomCss : ""); }, "主题已创建并切换"); });
-    panel.querySelector('[data-modal-confirm="delete"]')?.addEventListener("click", () => void runAction("正在删除主题…", async () => { state = await call("theme.package.delete", { id: draft.id }); draft = clone(state.activeTheme); snapshot = clone(state.activeTheme); draftCustomCss = state.customCss || ""; dirty = false; modal = null; await hydrateAssets(draft); applyTheme(draft, state.customCssTrusted ? draftCustomCss : ""); }, "主题已删除，已切换到默认主题"));
-    panel.querySelector('[data-modal-confirm="discard"]')?.addEventListener("click", () => { modal = null; cancelPreview(); hidePanel(); });
-    panel.querySelector('[data-modal-confirm="apply"]')?.addEventListener("click", () => void runAction("正在应用主题…", async () => { await applyDraft(); modal = null; hidePanel(); }, "主题已应用"));
+    panel.querySelector('[data-modal-form="edit-theme"]')?.addEventListener("submit", event => { event.preventDefault(); const name = panel.querySelector("[data-modal-theme-name]")?.value.trim(); const description = panel.querySelector("[data-modal-theme-description]")?.value.trim() || ""; if (!name) { setStatus("请输入主题名称", "error"); return; } void runAction("正在保存主题信息…", async () => { const updated = await call("theme.package.metadata", { id:modal.theme.id, name, description }); state.themes = state.themes.map(theme => theme.id === updated.id ? updated : theme); if (draft.id === updated.id) { draft.name = updated.name; draft.description = updated.description; snapshot.name = updated.name; snapshot.description = updated.description; state.activeTheme = clone(updated); } modal = null; }, "主题信息已保存"); });
+    panel.querySelector('[data-modal-confirm="delete"]')?.addEventListener("click", () => void runAction("正在删除主题…", async () => { state = await call("theme.package.delete", { id: modal.theme.id }); draft = clone(state.activeTheme); snapshot = clone(state.activeTheme); draftCustomCss = state.customCss || ""; dirty = false; modal = null; await hydrateAssets(draft); applyTheme(draft, state.customCssTrusted ? draftCustomCss : ""); }, "主题已删除"));
+    panel.querySelector('[data-modal-confirm="discard"]')?.addEventListener("click", () => void discardAndClose());
+    panel.querySelector('[data-modal-confirm="apply"]')?.addEventListener("click", () => void applyAndClose());
     panel.querySelectorAll("[data-path]").forEach(input => input.addEventListener(input.tagName === "SELECT" || input.type === "checkbox" ? "change" : "input", () => { const value = input.type === "checkbox" ? input.checked : input.type === "number" || input.type === "range" ? Number(input.value) : input.value; setPath(draft, input.dataset.path, value); input.parentElement.querySelector("output")?.replaceChildren(input.type === "range" ? rangeValue(value, input.step) : input.value); markDirty(); if (input.type === "checkbox" || input.tagName === "SELECT") renderPanel(); }));
     panel.querySelectorAll("[data-color-path]").forEach(input => input.addEventListener("input", () => { const path = input.dataset.colorPath; setPath(draft, path, input.value.toUpperCase()); const text = panel.querySelector(`[data-color-text="${path}"]`); if (text) text.value = input.value.toUpperCase(); markDirty(); }));
     panel.querySelectorAll("[data-color-text]").forEach(input => input.addEventListener("change", () => { const value = input.value.trim(); const path = input.dataset.colorText; if (!value) { setPath(draft, path, null); markDirty(); return; } if (!/^#[0-9a-f]{6}$/i.test(value)) { input.value = normalizeColor(getPath(draft, path)).toUpperCase(); setStatus("颜色必须使用 #RRGGBB", "error"); return; } setPath(draft, path, value.toUpperCase()); const swatch = panel.querySelector(`[data-color-path="${path}"]`); if (swatch) swatch.value = value; markDirty(); }));
@@ -1214,6 +1353,117 @@ ${customCss || ""}`;
     panel.querySelector("[data-ai-workbench]")?.addEventListener("click", openStudio);
     panel.querySelector("[data-custom-css]")?.addEventListener("input", event => { draftCustomCss = event.target.value; markDirty(); });
     panel.querySelector("[data-custom-css-enabled]")?.addEventListener("change", event => { state.customCssTrusted = event.target.checked; markDirty(); });
+    panel.querySelector("[data-css-inspector]")?.addEventListener("click", startCssInspector);
+    panel.querySelectorAll("[data-trigger-setting]").forEach(input => input.addEventListener(input.tagName === "SELECT" ? "change" : "input", () => { triggerAppearanceDraft ||= clone(state.settings.triggerAppearance); triggerAppearanceDraft[input.dataset.triggerSetting] = input.tagName === "SELECT" ? input.value : Number(input.value); input.parentElement.querySelector("output")?.replaceChildren(input.value); applyTriggerAppearance(triggerAppearanceDraft); const preview = panel.querySelector(".ti-trigger-preview > span"); if (preview) preview.style.cssText = triggerStyle(triggerAppearanceDraft); }));
+    panel.querySelector("[data-trigger-save]")?.addEventListener("click", () => void runAction("正在保存入口设置…", async () => { state = await call("app.trigger.save", { appearance:triggerAppearanceDraft || state.settings.triggerAppearance }); triggerAppearanceDraft = clone(state.settings.triggerAppearance); applyTriggerAppearance(); }, "入口设置已保存"));
+    panel.querySelector("[data-trigger-icon-import]")?.addEventListener("click", () => void runAction("等待选择入口图标…", async () => { state = await call("app.trigger.icon.import"); triggerAppearanceDraft = clone(state.settings.triggerAppearance); applyTriggerAppearance(); }, "入口图标已更新"));
+    panel.querySelector("[data-trigger-icon-reset]")?.addEventListener("click", () => void runAction("正在恢复默认图标…", async () => { state = await call("app.trigger.icon.reset"); triggerAppearanceDraft = clone(state.settings.triggerAppearance); applyTriggerAppearance(); }, "已恢复默认入口图标"));
+  }
+
+  async function loadThemeThumbnail(thumbnail) {
+    const key = thumbnail.dataset.thumbnailKey;
+    const themeId = thumbnail.dataset.themeId;
+    const path = thumbnail.dataset.themeHero;
+    if (!key || !themeId || !path) return;
+    let url = themeThumbnailUrls.get(key) || "";
+    if (!url) {
+      let request = themeThumbnailRequests.get(key);
+      if (!request) {
+        request = call("theme.thumbnail", { id:themeId, path })
+          .then(result => isPreviewDataUrl(result.url) ? result.url : "")
+          .catch(() => "")
+          .finally(() => themeThumbnailRequests.delete(key));
+        themeThumbnailRequests.set(key, request);
+      }
+      url = await request;
+      if (url) themeThumbnailUrls.set(key, url);
+    }
+    if (!thumbnail.isConnected || thumbnail.dataset.thumbnailKey !== key) return;
+    const image = thumbnail.querySelector("img");
+    if (url && image) image.src = url;
+    else {
+      thumbnail.dataset.loading = "false";
+      thumbnail.dataset.loaded = "false";
+    }
+  }
+
+  function startCssInspector() {
+    cssInspectorCleanup?.();
+    const panel = document.getElementById(PANEL_ID);
+    if (panel) panel.dataset.open = "false";
+    let highlighted = null;
+    let previousOutline = null;
+    const clearHighlight = () => {
+      if (!highlighted) return;
+      for (const [property, value, priority] of previousOutline || []) {
+        if (value) highlighted.style.setProperty(property, value, priority);
+        else highlighted.style.removeProperty(property);
+      }
+      highlighted = null;
+      previousOutline = null;
+    };
+    const move = event => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target || target.closest(`#${PANEL_ID},.ti-studio-backdrop,#${TRIGGER_ID}`)) return;
+      if (target === highlighted) return;
+      clearHighlight();
+      highlighted = target;
+      previousOutline = ["outline", "outline-offset"].map(property => [property, target.style.getPropertyValue(property), target.style.getPropertyPriority(property)]);
+      target.style.setProperty("outline", "2px solid #8b5cf6", "important");
+      target.style.setProperty("outline-offset", "2px", "important");
+    };
+    const cleanup = () => {
+      clearHighlight();
+      document.removeEventListener("mousemove", move, true);
+      document.removeEventListener("click", pick, true);
+      document.removeEventListener("keydown", cancel, true);
+      cssInspectorCleanup = null;
+    };
+    const finish = selector => {
+      cleanup();
+      if (panel) panel.dataset.open = "true";
+      if (!selector) return;
+      draftCustomCss += `${draftCustomCss.trim() ? "\n\n" : ""}${selector} {\n  \n}`;
+      markDirty();
+      renderPanel();
+      const textarea = document.querySelector("[data-custom-css]");
+      textarea?.focus();
+      textarea?.setSelectionRange(Math.max(0, draftCustomCss.length - 2), Math.max(0, draftCustomCss.length - 2));
+    };
+    const pick = event => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target || target.closest(`#${PANEL_ID},.ti-studio-backdrop,#${TRIGGER_ID}`)) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      finish(cssSelectorFor(target));
+    };
+    const cancel = event => { if (event.key === "Escape") finish(""); };
+    cssInspectorCleanup = cleanup;
+    document.addEventListener("mousemove", move, true);
+    document.addEventListener("click", pick, true);
+    document.addEventListener("keydown", cancel, true);
+  }
+
+  function cssSelectorFor(element) {
+    if (element.id) return `#${CSS.escape(element.id)}`;
+    const path = [];
+    let node = element;
+    while (node instanceof Element && node !== document.body && path.length < 5) {
+      let part = node.localName;
+      const stableAttribute = [...node.attributes].find(attribute => /^(data-(testid|app-action|codex|composer)|aria-label)$/.test(attribute.name) && attribute.value);
+      if (stableAttribute) {
+        part += `[${stableAttribute.name}="${CSS.escape(stableAttribute.value)}"]`;
+        path.unshift(part);
+        break;
+      }
+      const classes = [...node.classList].filter(name => !name.startsWith("ti-") && !/^[a-z]{1,2}\d/i.test(name)).slice(0, 2);
+      if (classes.length) part += classes.map(name => `.${CSS.escape(name)}`).join("");
+      const siblings = node.parentElement ? [...node.parentElement.children].filter(candidate => candidate.localName === node.localName) : [];
+      if (siblings.length > 1) part += `:nth-of-type(${siblings.indexOf(node) + 1})`;
+      path.unshift(part);
+      node = node.parentElement;
+    }
+    return path.join(" > ");
   }
 
   function defaultBackground(kind, key) {
@@ -1290,6 +1540,7 @@ ${customCss || ""}`;
   async function clearAiReference(render = true) {
     const previous = aiReferences;
     aiReferences = [];
+    previous.forEach(item => { thumbnailUrls.delete(previewCacheKey(item)); thumbnailUrls.delete(item.path); });
     await cancelPreviewSessions(previous);
     if (render) renderPanel();
   }
@@ -1299,19 +1550,41 @@ ${customCss || ""}`;
     for (const item of items.filter(Boolean)) {
       if (!item.session || !item.path || existing.has(`${item.session}:${item.path}`)) continue;
       if (aiReferences.length >= 6) break;
-      item.previewUrl = await previewDataUrl(item);
+      item.previewUrl = "";
+      item.previewState = "loading";
       aiReferences.push(item);
       existing.add(`${item.session}:${item.path}`);
+      void refreshReferencePreview(item);
     }
+    refreshStudioReferenceList();
   }
 
   async function removeAiReference(index, render = true) {
     const [removed] = aiReferences.splice(index, 1);
-    if (removed) await call("theme.preview.cancel", { session: removed.session }).catch(() => {});
-    if (render) renderStudio();
+    if (removed) { thumbnailUrls.delete(previewCacheKey(removed)); thumbnailUrls.delete(removed.path); await call("theme.preview.cancel", { session: removed.session }).catch(() => {}); }
+    if (render) refreshStudioReferenceList();
   }
 
   function generationIsActive(epoch) { return !destroyed && epoch === generationEpoch && busy; }
+
+  function resetGenerationWorkspace() {
+    const previousAssets = stagingAssets;
+    stagingAssets = [];
+    stagedUrls.clear();
+    previousAssets.forEach(asset => thumbnailUrls.delete(asset.path));
+    if (previousAssets.length) void cancelPreviewSessions(previousAssets);
+    const baseline = studioBaseline?.draft || snapshot;
+    if (baseline) {
+      draft = clone(baseline);
+      draftCustomCss = studioBaseline?.customCss || state?.customCss || "";
+      if (studioBaseline) state.customCssTrusted = studioBaseline.customCssTrusted;
+      applyTheme(draft, state?.customCssTrusted ? draftCustomCss : "");
+    }
+    dirty = false;
+    studioProgressSignature = "";
+    statusMessage = "";
+    statusKind = "";
+  }
 
   async function generateAiTheme(epoch) {
     await saveAiSettings();
@@ -1322,16 +1595,7 @@ ${customCss || ""}`;
     aiRequestLog = [];
     let result;
     try {
-      result = await call("ai.generate", {
-        prompt: aiPrompt,
-        language: aiLanguage,
-        generateImages: aiGenerateImages,
-        generateSidebarWatermark: aiGenerateSidebarWatermark,
-        generateSystemIcons: aiGenerateSystemIcons,
-        imageConcurrency: aiImageConcurrency,
-        references: aiReferences.map(({ session, path }) => ({ session, path })),
-        resourcePlans: aiResourcePlans,
-      });
+      result = await call("ai.generate", currentGenerationRequest());
     } catch (error) {
       const logs = await call("ai.log.get").catch(() => []);
       if (!generationIsActive(epoch)) return;
@@ -1339,10 +1603,12 @@ ${customCss || ""}`;
       throw error;
     }
     if (!generationIsActive(epoch)) return;
+    aiGenerationProgress = { ...aiGenerationProgress, state: "finalizing", message: "图片资源已完成，正在整理预览和草稿" };
+    renderStudio(false);
     const logs = await call("ai.log.get").catch(() => []);
     if (!generationIsActive(epoch)) return;
     aiRequestLog = logs;
-    const complete = await restoreCompleteGeneration(result, () => generationIsActive(epoch), 3);
+    const complete = await restoreCompleteGeneration(result, () => generationIsActive(epoch), 3, currentGenerationRequest());
     if (!complete || !generationIsActive(epoch)) throw new Error("生成资源尚未完整加载，请稍后重试");
     result = complete.result;
     const nextKeys = new Set((result.assets || []).map(asset => `${asset.session}:${asset.path}`));
@@ -1360,7 +1626,6 @@ ${customCss || ""}`;
     complete.urls.forEach((url, path) => stagedUrls.set(path, url));
     dirty = true;
     aiGeneratedDraft = true;
-    applyTheme(draft, "");
   }
 
   async function regeneratePaletteOnly() {
@@ -1397,6 +1662,21 @@ ${customCss || ""}`;
       busy = false;
       renderStudio(true);
     }
+  }
+
+  function currentGenerationRequest() {
+    return {
+      prompt: aiPrompt,
+      themeName: aiThemeName,
+      themeDescription: aiThemeDescription,
+      language: aiLanguage,
+      generateImages: aiGenerateImages,
+      generateSidebarWatermark: aiGenerateSidebarWatermark,
+      generateSystemIcons: aiGenerateSystemIcons,
+      imageConcurrency: aiImageConcurrency,
+      references: aiReferences.map(({ session, path }) => ({ session, path })),
+      resourcePlans: aiResourcePlans,
+    };
   }
 
   function mergePaletteTheme(next) {
@@ -1452,7 +1732,8 @@ ${customCss || ""}`;
     busy = true;
     renderStudio();
     try {
-      const restored = await restoreCompleteGeneration(null, () => !destroyed && lifecycle === lifecycleEpoch && operationEpoch === generationEpoch, 4);
+      const hasCurrentRequirements = Boolean(aiPrompt.trim() || aiReferences.length || aiResourcePlans.length);
+      const restored = await restoreCompleteGeneration(null, () => !destroyed && lifecycle === lifecycleEpoch && operationEpoch === generationEpoch, 4, hasCurrentRequirements ? currentGenerationRequest() : null);
       if (!restored) throw new Error("生成检查点中的图片资源尚未完整加载，请稍后重试");
       const { result, urls } = restored;
       if (destroyed || lifecycle !== lifecycleEpoch || operationEpoch !== generationEpoch) return;
@@ -1479,7 +1760,8 @@ ${customCss || ""}`;
       statusKind = "success";
       await hydrateAssets(draft);
       if (destroyed || lifecycle !== lifecycleEpoch || operationEpoch !== generationEpoch) return;
-      applyTheme(draft, "");
+      studioPreviewRefreshPending = true;
+      studioPreviewReady = false;
     } catch (error) {
       if (destroyed || lifecycle !== lifecycleEpoch || operationEpoch !== generationEpoch) return;
       setStatus(error?.message || "恢复失败", "error");
@@ -1526,6 +1808,8 @@ ${customCss || ""}`;
   function openStudio() {
     if (destroyed) return;
     if (!studioOpen) {
+      aiThemeName = draft.name || "";
+      aiThemeDescription = draft.description || "";
       studioBaseline = {
         draft: clone(draft),
         customCss: draftCustomCss,
@@ -1544,8 +1828,14 @@ ${customCss || ""}`;
   function closeStudio() {
     studioOpen = false;
     clearTimeout(studioTimer);
+    clearTimeout(studioDomTimer);
+    studioDomTimer = 0;
     document.querySelector(".ti-studio-backdrop")?.remove();
     if (studioBaseline) {
+      const discardedAssets = stagingAssets;
+      const baselineKeys = new Set(studioBaseline.stagingAssets.map(asset => `${asset.session}:${asset.path}`));
+      void cancelPreviewSessions(discardedAssets.filter(asset => !baselineKeys.has(`${asset.session}:${asset.path}`)));
+      discardedAssets.forEach(asset => { if (!baselineKeys.has(`${asset.session}:${asset.path}`)) thumbnailUrls.delete(asset.path); });
       draft = clone(studioBaseline.draft);
       draftCustomCss = studioBaseline.customCss;
       stagingAssets = clone(studioBaseline.stagingAssets);
@@ -1565,7 +1855,7 @@ ${customCss || ""}`;
   function renderStudio(refreshDom = false) {
     if (destroyed || !studioOpen || !draft) return;
     const previous = document.querySelector(".ti-studio-backdrop");
-    const previousFrame = !refreshDom ? previous?.querySelector(".ti-studio-frame") : null;
+    const previousFrame = previous?.querySelector(".ti-studio-frame");
     const previousPane = previous?.querySelector(".ti-studio-pane");
     if (previousPane) studioPaneScrollTop = previousPane.scrollTop;
     const root = document.createElement("div");
@@ -1584,16 +1874,50 @@ ${customCss || ""}`;
     if (generateImagesLabel && !studio.querySelector("[data-studio-image-concurrency]")) generateImagesLabel.insertAdjacentHTML("afterend", `<label class="ti-ai-checkbox"><input type="checkbox" data-studio-generate-watermark ${aiGenerateSidebarWatermark ? "checked" : ""} ${busy || !aiGenerateImages ? "disabled" : ""}><span>生成侧栏水印（默认关闭，避免遮挡导航）</span></label><label class="ti-ai-checkbox"><input type="checkbox" data-studio-generate-system-icons ${aiGenerateSystemIcons ? "checked" : ""} ${busy || !aiGenerateImages ? "disabled" : ""}><span>生成同主题系统图标（3×3 图集自动切割）</span></label><div class="ti-row ti-compact-row"><div class="ti-label">图片并发</div><div><select class="ti-control" data-studio-image-concurrency ${busy ? "disabled" : ""}>${[1,2,3,4].map(value => `<option value="${value}" ${aiImageConcurrency === value ? "selected" : ""}>${value}</option>`).join("")}</select></div></div><button class="ti-button" type="button" data-studio-regenerate-palette ${busy ? "disabled" : ""}>只重新生成配色</button>`);
     const headerActions = studio.querySelector(".ti-studio-header .ti-inline");
     if (headerActions) headerActions.insertAdjacentHTML("afterbegin", aiGeneratedDraft ? `<button class="ti-button" data-primary="true" data-studio-save>保存为新主题</button>` : `<button class="ti-button" data-studio-restore>恢复上次生成</button>`);
+    const resourceForm = studio.querySelector("[data-studio-plan-form]");
+    if (resourceForm) {
+      resourceForm.querySelector("strong").textContent = "立即生成资源";
+      resourceForm.querySelector('button[type="submit"]').textContent = "立即生成并应用";
+      const planTitle = resourceForm.nextElementSibling;
+      const planList = planTitle?.nextElementSibling;
+      planTitle?.remove();
+      planList?.remove();
+    }
+    if (prompt) prompt.insertAdjacentHTML("afterend", `<div class="ti-studio-metadata">${row("主题名称", `<input class="ti-control" data-studio-meta="name" maxlength="80" value="${escapeHtml(aiThemeName)}" ${busy ? "disabled" : ""}>`)}${row("主题介绍", `<textarea class="ti-control ti-small-textarea" data-studio-meta="description" maxlength="240" ${busy ? "disabled" : ""}>${escapeHtml(aiThemeDescription)}</textarea>`)}</div>`);
     if (studioSaveOpen) studio.insertAdjacentHTML("beforeend", `<div class="ti-studio-modal-backdrop"><form class="ti-modal" data-studio-save-form><div class="ti-modal-title">保存为新主题</div><div class="ti-modal-copy">生成结果会复制到主题库并立即启用；保存成功后才会清理恢复检查点。</div><label class="ti-field-label" for="ti-generated-theme-name">主题名称</label><input id="ti-generated-theme-name" class="ti-control" data-studio-save-name maxlength="80" value="${escapeHtml(draft.name)}" autocomplete="off"><div class="ti-modal-actions"><button class="ti-button" type="button" data-studio-save-cancel>取消</button><button class="ti-button" data-primary="true" type="submit">保存并启用</button></div></form></div>`);
     if (previousFrame) studio.querySelector(".ti-studio-frame")?.replaceWith(previousFrame);
     previous?.replaceWith(studio) || document.body.appendChild(studio);
     bindStudio(studio);
+    const frame = studio.querySelector(".ti-studio-frame");
+    if (frame) frame.hidden = !studioPreviewReady;
+    if (!studioPreviewReady && !studioPreviewRefreshPending) {
+      const frameWrap = studio.querySelector(".ti-studio-frame-wrap");
+      if (frameWrap) {
+        const placeholder = document.createElement("div");
+        placeholder.className = "ti-studio-preview-placeholder";
+        placeholder.textContent = "生成完成后可查看预览 DOM";
+        frameWrap.appendChild(placeholder);
+      }
+    }
+    if (studioPreviewRefreshPending && !busy) {
+      const frameWrap = studio.querySelector(".ti-studio-frame-wrap");
+      if (frameWrap) {
+        const overlay = document.createElement("div");
+        overlay.className = "ti-studio-preview-refresh-overlay";
+        overlay.innerHTML = `<strong>生成已完成</strong><span>预览 DOM 可能仍是生成前的副本，请刷新后查看最新主题。</span><button class="ti-button" data-studio-preview-refresh type="button" data-primary="true">刷新预览 DOM</button>`;
+        frameWrap.appendChild(overlay);
+        overlay.querySelector("[data-studio-preview-refresh]")?.addEventListener("click", () => void activateStudioPreview());
+      }
+    }
+    if (busy) studio.querySelectorAll("button,input,textarea,select").forEach(control => {
+      if (!control.matches("[data-studio-tab],[data-studio-close]")) control.disabled = true;
+    });
     const pane = studio.querySelector(".ti-studio-pane");
     if (pane) {
       pane.scrollTop = studioPaneScrollTop;
       pane.addEventListener("scroll", () => { studioPaneScrollTop = pane.scrollTop; }, { passive: true });
     }
-    refreshStudioDom(studio, refreshDom);
+    scheduleStudioDomRefresh(studio, refreshDom);
     renderStudioDecorations(studio);
   }
 
@@ -1603,20 +1927,79 @@ ${customCss || ""}`;
     copy.querySelector(`#${STYLE_ID}`)?.remove();
     const previewStyle = document.createElement("style");
     previewStyle.id = STYLE_ID;
-    previewStyle.textContent = themeCss(draft, state?.customCssTrusted ? draftCustomCss : "");
+    previewStyle.textContent = `${themeCss(draft, state?.customCssTrusted ? draftCustomCss : "")}
+button,[role="button"]{opacity:1!important;}
+.main-surface :is(button,[role="button"]){color:var(--ti-content-fg)!important;}
+:is([data-codex-composer-submit],[data-app-action-submit],[data-composer-navigation-target="submit"]),:is([data-codex-composer-submit],[data-app-action-submit],[data-composer-navigation-target="submit"]) *{color:var(--ti-accent-foreground)!important;}
+:is([data-codex-composer-submit],[data-app-action-submit],[data-composer-navigation-target="submit"]) svg{fill:currentColor!important;stroke:currentColor!important;opacity:1!important;}`;
     copy.querySelector("head")?.appendChild(previewStyle);
-    copy.querySelectorAll("[contenteditable],input,textarea,select,button,a").forEach(node => { node.removeAttribute("contenteditable"); node.removeAttribute("href"); node.setAttribute("tabindex", "-1"); });
+    copy.querySelectorAll("[contenteditable],input,textarea,select,button,a").forEach(node => { node.removeAttribute("contenteditable"); node.removeAttribute("href"); node.removeAttribute("disabled"); node.removeAttribute("aria-disabled"); node.style.removeProperty("opacity"); node.setAttribute("tabindex", "-1"); });
+    copy.querySelectorAll("button svg,[role=button] svg").forEach(node => { node.style.color = "currentColor"; node.style.opacity = "1"; });
     copy.querySelectorAll("iframe").forEach(node => node.replaceWith(document.createElement("div")));
     const base = copy.querySelector("head")?.appendChild(document.createElement("base"));
     if (base) base.href = location.href;
-    return `<!doctype html>${copy.outerHTML}`;
+    let html = copy.outerHTML;
+    for (const asset of stagingAssets) {
+      const source = stagedUrls.get(asset.path);
+      const thumbnail = thumbnailUrls.get(previewCacheKey(asset)) || thumbnailUrls.get(asset.path);
+      if (source && thumbnail) html = html.split(source).join(thumbnail);
+    }
+    return `<!doctype html>${html}`;
+  }
+
+  async function prepareStudioPreviewAssets() {
+    const pending = stagingAssets.filter(asset => !thumbnailUrls.has(previewCacheKey(asset)) && !thumbnailUrls.has(asset.path));
+    await mapConcurrent(pending, 1, async asset => {
+      const url = await previewDataUrl(asset, 2, false);
+      if (url) {
+        thumbnailUrls.set(previewCacheKey(asset), url);
+        thumbnailUrls.set(asset.path, url);
+      }
+    });
+  }
+
+  async function activateStudioPreview() {
+    if (destroyed || !studioOpen || busy || studioPreviewPreparing) return;
+    studioPreviewPreparing = true;
+    studioPreviewRefreshPending = false;
+    studioPreviewReady = false;
+    try {
+      await prepareStudioPreviewAssets();
+      if (destroyed || !studioOpen || busy) return;
+      studioPreviewReady = true;
+      applyTheme(draft, "");
+      renderStudio(true);
+    } finally {
+      studioPreviewPreparing = false;
+    }
   }
 
   function refreshStudioDom(studio, force) {
     const frame = studio.querySelector(".ti-studio-frame");
-    if (!frame || (!force && frame.dataset.loaded === "true")) return;
+    if (!studioPreviewReady || !frame || (!force && frame.dataset.loaded === "true")) return;
     frame.srcdoc = staticDomSnapshot();
     frame.dataset.loaded = "true";
+  }
+
+  function scheduleStudioDomRefresh(studio, force) {
+    clearTimeout(studioDomTimer);
+    if (!studioPreviewReady) return;
+    const refresh = () => {
+      studioDomTimer = 0;
+      if (destroyed || !studioOpen || !studio?.isConnected) return;
+      try {
+        refreshStudioDom(studio, force);
+      } catch (error) {
+        const frame = studio.querySelector(".ti-studio-frame");
+        if (frame) {
+          frame.dataset.loaded = "true";
+          frame.dataset.previewError = "true";
+          frame.srcdoc = `<!doctype html><html><body style="margin:0;display:grid;place-items:center;min-height:100vh;background:#111722;color:#A9B8C8;font:14px Segoe UI,sans-serif;text-align:center"><div>静态预览暂时不可用<br><small>工作台仍可继续使用，稍后可点击“刷新 DOM 副本”重试</small></div></body></html>`;
+        }
+        console.error("Theme Inject preview failed", error);
+      }
+    };
+    studioDomTimer = setTimeout(refresh, 0);
   }
 
   function renderStudioDecorations(studio) {
@@ -1656,14 +2039,14 @@ ${customCss || ""}`;
     studio.querySelector("[data-studio-save]")?.addEventListener("click", () => { studioSaveOpen = true; renderStudio(); queueMicrotask(() => document.querySelector("[data-studio-save-name]")?.select()); });
     studio.querySelector("[data-studio-save-cancel]")?.addEventListener("click", () => { studioSaveOpen = false; renderStudio(); });
     studio.querySelector("[data-studio-save-form]")?.addEventListener("submit", event => { event.preventDefault(); const name = studio.querySelector("[data-studio-save-name]")?.value.trim(); if (!name) return; void saveGeneratedTheme(name); });
-    studio.querySelector("[data-studio-refresh]")?.addEventListener("click", () => renderStudio(true));
+    studio.querySelector("[data-studio-refresh]")?.addEventListener("click", () => void activateStudioPreview());
     studio.querySelectorAll("[data-studio-tab]").forEach(button => button.addEventListener("click", () => { studioTab = button.dataset.studioTab; renderStudio(); }));
     studio.querySelector("[data-studio-prompt]")?.addEventListener("input", event => { aiPrompt = event.target.value; });
     studio.querySelector("[data-studio-language]")?.addEventListener("change", event => { aiLanguage = event.target.value; });
     studio.querySelector("[data-studio-generate-images]")?.addEventListener("change", event => { aiGenerateImages = event.target.checked; renderStudio(); });
     studio.querySelector("[data-studio-generate-watermark]")?.addEventListener("change", event => { aiGenerateSidebarWatermark = event.target.checked; });
     studio.querySelector("[data-studio-generate-system-icons]")?.addEventListener("change", event => { aiGenerateSystemIcons = event.target.checked; });
-    studio.querySelector("[data-studio-image-concurrency]")?.addEventListener("change", event => { aiImageConcurrency = Math.max(1, Math.min(4, Number(event.target.value) || 2)); });
+    studio.querySelector("[data-studio-image-concurrency]")?.addEventListener("change", event => { aiImageConcurrency = Math.max(1, Math.min(4, Number(event.target.value) || 4)); });
     studio.querySelector("[data-studio-regenerate-palette]")?.addEventListener("click", () => void regeneratePaletteOnly());
     studio.querySelector("[data-studio-reference-select]")?.addEventListener("click", () => void chooseStudioReference());
     studio.querySelector("[data-studio-reference-clear]")?.addEventListener("click", () => void clearStudioReference());
@@ -1674,18 +2057,20 @@ ${customCss || ""}`;
       const slot = studio.querySelector("[data-studio-plan-slot]")?.value;
       const prompt = studio.querySelector("[data-studio-plan-prompt]")?.value.trim();
       if (!slot || !prompt) return;
-      const existing = aiResourcePlans.find(plan => plan.slot === slot);
-      if (existing) existing.prompt = prompt; else aiResourcePlans.push({ slot, prompt });
-      renderStudio();
+      void generateStudioResource(slot, prompt);
     });
     studio.querySelectorAll("[data-studio-remove-plan]").forEach(button => button.addEventListener("click", () => { aiResourcePlans.splice(Number(button.dataset.studioRemovePlan), 1); renderStudio(); }));
+    studio.querySelectorAll("[data-studio-regenerate-resource]").forEach(button => button.addEventListener("click", () => void generateStudioResource(button.dataset.studioRegenerateResource, button.dataset.resourcePrompt || "")));
     studio.querySelector("[data-studio-generate]")?.addEventListener("click", () => {
       if (busy) return;
       const epoch = ++generationEpoch;
+      resetGenerationWorkspace();
       busy = true;
       aiGenerationProgress = { state: "planning", items: [] };
       aiRequestLog = [];
       aiGeneratedDraft = false;
+      studioPreviewRefreshPending = false;
+      studioPreviewReady = false;
       renderStudio();
       void pollGenerationProgress(epoch);
       void generateAiTheme(epoch).then(async () => {
@@ -1695,8 +2080,10 @@ ${customCss || ""}`;
         busy = false;
         aiGenerationProgress = progress;
         aiRequestLog = logs;
+        studioPreviewRefreshPending = true;
+        studioPreviewReady = false;
         clearTimeout(studioTimer);
-        renderStudio(true);
+        renderStudio(false);
       }).catch(async error => {
         if (!generationIsActive(epoch)) return;
         const progress = await call("ai.progress.get").catch(() => ({ ...aiGenerationProgress, state:"failed", message:error?.message || "生成失败" }));
@@ -1714,6 +2101,10 @@ ${customCss || ""}`;
     studio.querySelectorAll("[data-color-path]").forEach(input => input.addEventListener("input", () => { setPath(draft, input.dataset.colorPath, input.value.toUpperCase()); markStudioDirty(); scheduleStudioPreview(studio); }));
     studio.querySelectorAll("[data-color-text]").forEach(input => input.addEventListener("change", () => { if (/^#[0-9a-f]{6}$/i.test(input.value.trim())) { setPath(draft, input.dataset.colorText, input.value.trim().toUpperCase()); markStudioDirty(); refreshStudioDom(studio, true); } }));
     studio.querySelectorAll("[data-path]").forEach(input => input.addEventListener("input", () => { setPath(draft, input.dataset.path, Number(input.value)); markStudioDirty(); scheduleStudioPreview(studio); }));
+    studio.querySelectorAll("[data-studio-meta]").forEach(input => input.addEventListener("input", () => {
+      if (input.dataset.studioMeta === "name") aiThemeName = input.value;
+      else aiThemeDescription = input.value;
+    }));
     studio.querySelectorAll("[data-studio-select-decoration]").forEach(button => button.addEventListener("click", () => { studioSelectedDecoration = Number(button.dataset.studioSelectDecoration); renderStudio(); }));
     studio.querySelectorAll("[data-studio-decoration-path]").forEach(input => input.addEventListener(input.tagName === "SELECT" ? "change" : "input", () => {
       const decoration = draft.skin.decorations[studioSelectedDecoration];
@@ -1724,6 +2115,54 @@ ${customCss || ""}`;
       scheduleStudioPreview(studio);
     }));
     studio.querySelectorAll(".ti-studio-decoration").forEach(image => image.addEventListener("pointerdown", beginDecorationDrag));
+  }
+
+  async function refreshReferencePreview(item) {
+    const url = await previewDataUrl(item, 4);
+    if (destroyed || !aiReferences.includes(item)) return;
+    item.previewUrl = url || "";
+    item.previewState = url ? "loaded" : "failed";
+    if (studioOpen) refreshStudioReferenceList();
+    else if (document.getElementById(PANEL_ID)?.dataset.open === "true") renderPanel();
+  }
+
+  async function generateStudioResource(slot, prompt) {
+    if (busy || !slot || !prompt.trim()) return;
+    generationEpoch += 1;
+    clearTimeout(studioTimer);
+    busy = true;
+    renderStudio();
+    try {
+      await saveAiSettings();
+      if (!state.ai?.hasImageApiKey) throw new Error("请先保存生图 Key");
+      const previous = stagingAssets.find(asset => asset.slot === slot);
+      const result = await call("ai.resource.generate", { theme: draft, slot, prompt: prompt.trim(), references: aiReferences.map(({ session, path }) => ({ session, path })) });
+      if (previous) await call("theme.preview.cancel", { session: previous.session }).catch(() => {});
+      draft = clone(result.theme);
+      aiPrompt = result.prompt || aiPrompt;
+      aiThemeName = result.themeName || aiThemeName || draft.name;
+      aiThemeDescription = result.themeDescription || aiThemeDescription || draft.description || "";
+      stagingAssets = stagingAssets.filter(asset => asset.slot !== slot);
+      stagingAssets.push({ slot: result.asset.slot, session: result.asset.session, path: result.asset.path });
+      const previewUrl = await previewDataUrl(result.asset);
+      stagedUrls.set(result.asset.path, result.asset.previewUrl || previewUrl || "");
+      if (previous) { stagedUrls.delete(previous.path); thumbnailUrls.delete(previous.path); }
+      const existingItem = (aiGenerationProgress.items || []).find(item => item.slot === slot);
+      const item = { slot, label: resourceSlotLabel(slot), prompt: prompt.trim(), status: "completed", previewUrl, session: result.asset.session, path: result.asset.path, message: "已生成并覆盖当前草稿资源" };
+      if (existingItem) Object.assign(existingItem, item); else (aiGenerationProgress.items ||= []).push(item);
+      aiGenerationProgress.state = "completed";
+      aiGenerationProgress.message = `${resourceSlotLabel(slot)}已生成并应用`;
+      aiRequestLog = await call("ai.log.get").catch(() => aiRequestLog);
+      markStudioDirty();
+      studioPreviewRefreshPending = true;
+      studioPreviewReady = false;
+      setStatus(`${resourceSlotLabel(slot)}已生成并覆盖`, "success");
+    } catch (error) {
+      setStatus(error?.message || "资源生成失败", "error");
+    } finally {
+      busy = false;
+      renderStudio(true);
+    }
   }
 
   function beginDecorationDrag(event) {
@@ -1784,16 +2223,16 @@ ${customCss || ""}`;
     try {
       const result = await call("ai.reference.import");
       await addAiReferences(result.references || [result]);
-      renderStudio();
+      renderStudio(false);
     } catch (error) {
       setStatus(error?.message || "参考图加载失败", "error");
-      renderStudio();
+      renderStudio(false);
     }
   }
 
   async function clearStudioReference() {
     await clearAiReference(false);
-    renderStudio();
+    renderStudio(false);
   }
 
   async function pasteStudioReferences(event) {
@@ -1809,10 +2248,10 @@ ${customCss || ""}`;
       }
       await addAiReferences(uploaded);
       setStatus(`已粘贴 ${uploaded.length} 张参考图`, "success");
-      renderStudio();
+      renderStudio(false);
     } catch (error) {
       setStatus(error?.message || "粘贴参考图失败", "error");
-      renderStudio();
+      renderStudio(false);
     }
   }
 
@@ -1847,28 +2286,33 @@ ${customCss || ""}`;
   }
 
   function setStatus(message, kind = "") { if (destroyed) return; statusMessage = message; statusKind = kind; const node = document.querySelector(`#${PANEL_ID} .ti-status`); if (node) { node.dataset.kind = kind; node.replaceChildren(message); } }
+  function applyTriggerAppearance(override) { const trigger = document.getElementById(TRIGGER_ID); if (!trigger || !state) return; const appearance = override || state.settings?.triggerAppearance || { shape:"rounded", size:40, right:18, bottom:18, backgroundOpacity:.88, shadowStrength:.35 }; trigger.style.cssText = triggerStyle(appearance); trigger.style.right = `${appearance.right}px`; trigger.style.bottom = `${appearance.bottom}px`; const icon = trigger.querySelector("img"); if (icon) icon.src = state.triggerIcon || TOOLBAR_ICON; }
   function setBusy(value) { busy = value; const panel = document.getElementById(PANEL_ID); if (!panel) return; panel.dataset.busy = String(value); panel.setAttribute("aria-busy", String(value)); panel.querySelectorAll("button,input,select,textarea").forEach(control => control.disabled = value); }
   async function runAction(message, action, success) { if (busy) return; setBusy(true); setStatus(message); try { await action(); statusMessage = success; statusKind = "success"; } catch (error) { statusMessage = error?.message || "操作失败"; statusKind = "error"; } finally { setBusy(false); const panel = document.getElementById(PANEL_ID); if (panel?.dataset.open === "true") renderPanel(); } }
   function markDirty() { dirty = true; statusMessage = ""; statusKind = ""; scheduleDraftPreview(); document.querySelector(".ti-status")?.replaceChildren("有未应用修改"); }
-  async function applyDraft() { draft.skin.decorations = (draft.skin.decorations || []).filter(item => item.asset); const referenced = collectAssetPaths(draft); const unused = stagingAssets.filter(asset => !referenced.has(asset.path)); await cancelPreviewSessions(unused); stagingAssets = stagingAssets.filter(asset => referenced.has(asset.path)); const result = await call("theme.apply", { theme: draft, customCss: draftCustomCss, enableCustomCss: Boolean(state.customCssTrusted), stagingAssets: stagingAssets.map(({ session, path }) => ({ session, path })) }); stagingAssets = []; stagedUrls.clear(); await clearAiReference(false); state = result.state; draft = clone(result.theme); snapshot = clone(result.theme); draftCustomCss = state.customCss || ""; dirty = false; await hydrateAssets(draft); applyTheme(draft, state.customCssTrusted ? draftCustomCss : ""); renderPanel(); }
+  async function applyDraft(render = true) { draft.skin.decorations = (draft.skin.decorations || []).filter(item => item.asset); const referenced = collectAssetPaths(draft); const unused = stagingAssets.filter(asset => !referenced.has(asset.path)); await cancelPreviewSessions(unused); stagingAssets = stagingAssets.filter(asset => referenced.has(asset.path)); const result = await call("theme.apply", { theme: draft, customCss: draftCustomCss, enableCustomCss: Boolean(state.customCssTrusted), stagingAssets: stagingAssets.map(({ session, path }) => ({ session, path })) }); stagingAssets = []; stagedUrls.clear(); await clearAiReference(false); state = result.state; draft = clone(result.theme); snapshot = clone(result.theme); draftCustomCss = state.customCss || ""; dirty = false; await hydrateAssets(draft); applyTheme(draft, state.customCssTrusted ? draftCustomCss : ""); if (render) renderPanel(); }
   function collectAssetPaths(theme) { const paths = new Set(); [theme.background?.fullscreen, theme.background?.content, theme.background?.sidebar].forEach(background => { if (background?.kind === "image" && background.path) paths.add(background.path); }); Object.values(theme.skin?.resources || {}).forEach(path => typeof path === "string" && path && paths.add(path)); Object.values(theme.skin?.icons?.mappings || {}).forEach(path => path && paths.add(path)); (theme.skin?.decorations || []).forEach(item => item.asset && paths.add(item.asset)); (theme.skin?.home?.cards || []).forEach(item => item.icon && paths.add(item.icon)); return paths; }
   async function cancelStaging() { const pending = stagingAssets; const references = aiReferences; stagingAssets = []; aiReferences = []; stagedUrls.clear(); thumbnailUrls.clear(); await cancelPreviewSessions([...pending, ...references]); }
   function cancelPreview() { void cancelStaging().then(async () => { draft = clone(snapshot); draftCustomCss = state?.customCss || ""; dirty = false; if (snapshot) { await hydrateAssets(snapshot); applyTheme(snapshot, state?.customCssTrusted ? state.customCss || "" : ""); } renderPanel(); }); }
+  async function restorePreview() { await cancelStaging(); draft = clone(snapshot); draftCustomCss = state?.customCss || ""; dirty = false; if (snapshot) { await hydrateAssets(snapshot); applyTheme(snapshot, state?.customCssTrusted ? state.customCss || "" : ""); } }
+  async function discardAndClose() { if (busy) return; setBusy(true); try { await restorePreview(); modal = null; hidePanel(); } catch (error) { modal = null; setStatus(error?.message || "放弃修改失败", "error"); renderPanel(); } finally { setBusy(false); } }
+  async function applyAndClose() { if (busy) return; setBusy(true); setStatus("正在应用主题…"); try { await applyDraft(false); modal = null; statusMessage = "主题已应用"; statusKind = "success"; hidePanel(); } catch (error) { modal = null; setStatus(error?.message || "应用主题失败", "error"); renderPanel(); } finally { setBusy(false); } }
   function closePanel() { if (dirty) { modal = { kind: "close" }; renderPanel(); return; } void cancelStaging().then(hidePanel); }
-  function hidePanel() { aiApiKeyDraft = ""; aiImageApiKeyDraft = ""; const panel = document.getElementById(PANEL_ID); if (panel) panel.dataset.open = "false"; }
+  function hidePanel() { aiApiKeyDraft = ""; aiImageApiKeyDraft = ""; triggerAppearanceDraft = state?.settings?.triggerAppearance ? clone(state.settings.triggerAppearance) : null; applyTriggerAppearance(); const panel = document.getElementById(PANEL_ID); if (panel) panel.dataset.open = "false"; }
   async function reloadThemes() { state.themes = await call("theme.package.list"); }
-  async function reloadState() { const lifecycle = lifecycleEpoch; await cancelStaging(); if (destroyed || lifecycle !== lifecycleEpoch) return; state = await call("theme.state.get"); if (destroyed || lifecycle !== lifecycleEpoch) return; aiSettings = clone(state.ai); draft = clone(state.activeTheme); snapshot = clone(state.activeTheme); draftCustomCss = state.customCss || ""; dirty = false; await hydrateAssets(draft); if (destroyed || lifecycle !== lifecycleEpoch) return; applyTheme(draft, state.customCssTrusted ? draftCustomCss : ""); }
-  async function openPanel() { if (destroyed) return; const lifecycle = lifecycleEpoch; if (!state) await reloadState(); if (destroyed || lifecycle !== lifecycleEpoch || !state) return; draft = clone(state.activeTheme); snapshot = clone(state.activeTheme); draftCustomCss = state.customCss || ""; dirty = false; renderPanel(); }
-  function ensureTrigger() { if (destroyed) return; ensurePanelStyles(); if (document.getElementById(TRIGGER_ID) || !document.body) return; const button = document.createElement("button"); button.id = TRIGGER_ID; button.type = "button"; button.textContent = "主题"; button.addEventListener("click", () => void openPanel()); document.body.appendChild(button); }
-  function scheduleRefresh() { if (destroyed) return; clearTimeout(mutationTimer); if (draft) syncHome(draft); mutationTimer = setTimeout(() => { if (destroyed) return; ensureTrigger(); if (draft) { patchTitlebar(); mountBackgrounds(draft); syncSkin(draft); syncIcons(draft); syncNativeSurfaceContrast(); syncNativeButtonContrast(); patchDiffRoots(draft); patchTerminal(draft); } }, 60); }
-  function destroy() { if (destroyed) return; destroyed = true; lifecycleEpoch += 1; generationEpoch += 1; assetHydrationEpoch += 1; busy = false; studioOpen = false; studioSaveOpen = false; modal = null; activeDecorationDragCleanup?.(); activeDecorationDragCleanup = null; layoutResizeObserver.disconnect(); layoutResizeTarget = null; clearAssetRetry(); observer.disconnect(); window.removeEventListener("resize", scheduleRefresh); clearTimeout(mutationTimer); clearTimeout(studioTimer); mutationTimer = 0; studioTimer = 0; Object.values(BACKDROP_IDS).forEach(id => document.getElementById(id)?.remove()); document.getElementById(BRAND_ID)?.remove(); document.getElementById(HOME_ID)?.remove(); document.getElementById(DECORATIONS_ID)?.remove(); document.getElementById(PANEL_ID)?.remove(); document.getElementById(TRIGGER_ID)?.remove(); document.getElementById(PANEL_STYLE_ID)?.remove(); document.querySelector(".ti-studio-backdrop")?.remove(); document.querySelectorAll("[data-theme-inject-custom-icon]").forEach(node => { delete node.dataset.themeInjectCustomIcon; node.style.removeProperty("--ti-custom-icon"); }); const attachShadow = Element.prototype.attachShadow; if (attachShadow.__themeInjectOriginal) Element.prototype.attachShadow = attachShadow.__themeInjectOriginal; callbacks.forEach(callback => { clearTimeout(callback.timer); callback.reject(new Error("Theme Inject reloaded")); }); callbacks.clear(); }
+  async function reloadState() { const lifecycle = lifecycleEpoch; await cancelStaging(); if (destroyed || lifecycle !== lifecycleEpoch) return; state = await call("theme.state.get"); if (destroyed || lifecycle !== lifecycleEpoch) return; aiSettings = clone(state.ai); triggerAppearanceDraft = clone(state.settings.triggerAppearance); draft = clone(state.activeTheme); snapshot = clone(state.activeTheme); draftCustomCss = state.customCss || ""; dirty = false; await hydrateAssets(draft); if (destroyed || lifecycle !== lifecycleEpoch) return; applyTheme(draft, state.customCssTrusted ? draftCustomCss : ""); }
+  async function openPanel() { if (destroyed) return; const lifecycle = lifecycleEpoch; if (!state) await reloadState(); if (destroyed || lifecycle !== lifecycleEpoch || !state) return; triggerAppearanceDraft = clone(state.settings.triggerAppearance); applyTriggerAppearance(); draft = clone(state.activeTheme); snapshot = clone(state.activeTheme); draftCustomCss = state.customCss || ""; dirty = false; renderPanel(); }
+  function ensureTrigger() { if (destroyed) return; ensurePanelStyles(); if (document.getElementById(TRIGGER_ID) || !document.body) { applyTriggerAppearance(); return; } const button = document.createElement("button"); button.id = TRIGGER_ID; button.type = "button"; button.title = "打开 Codex 主题"; button.setAttribute("aria-label", "打开 Codex 主题"); const icon = document.createElement("img"); icon.src = state?.triggerIcon || TOOLBAR_ICON; icon.alt = ""; button.append(icon); button.addEventListener("click", () => void openPanel()); document.body.appendChild(button); applyTriggerAppearance(); }
+  function cleanupCssInspector() { cssInspectorCleanup?.(); cssInspectorCleanup = null; }
+  function scheduleRefresh() { if (destroyed) return; clearTimeout(mutationTimer); mutationTimer = setTimeout(() => { if (destroyed) return; ensureTrigger(); if (draft) { patchTitlebar(); mountBackgrounds(draft); syncSkin(draft); syncIcons(draft); syncNativeSurfaceContrast(); syncNativeButtonContrast(); patchDiffRoots(draft); patchTerminal(draft); } }, 60); }
+  function destroy() { if (destroyed) return; destroyed = true; lifecycleEpoch += 1; generationEpoch += 1; assetHydrationEpoch += 1; busy = false; studioOpen = false; studioSaveOpen = false; modal = null; activeDecorationDragCleanup?.(); activeDecorationDragCleanup = null; layoutResizeObserver.disconnect(); layoutResizeTarget = null; clearAssetRetry(); observer.disconnect(); window.removeEventListener("resize", scheduleRefresh); clearTimeout(mutationTimer); clearTimeout(studioTimer); clearTimeout(studioDomTimer); mutationTimer = 0; studioTimer = 0; studioDomTimer = 0; Object.values(BACKDROP_IDS).forEach(id => document.getElementById(id)?.remove()); document.getElementById(BRAND_ID)?.remove(); document.getElementById(HOME_ID)?.remove(); document.getElementById(DECORATIONS_ID)?.remove(); document.getElementById(PANEL_ID)?.remove(); document.getElementById(TRIGGER_ID)?.remove(); document.getElementById(PANEL_STYLE_ID)?.remove(); document.querySelector(".ti-studio-backdrop")?.remove(); document.querySelectorAll("[data-theme-inject-custom-icon]").forEach(node => { delete node.dataset.themeInjectCustomIcon; node.style.removeProperty("--ti-custom-icon"); }); const attachShadow = Element.prototype.attachShadow; if (attachShadow.__themeInjectOriginal) Element.prototype.attachShadow = attachShadow.__themeInjectOriginal; callbacks.forEach(callback => { clearTimeout(callback.timer); callback.reject(new Error("Theme Inject reloaded")); }); callbacks.clear(); }
 
   installAttachShadowHook();
   const layoutResizeObserver = new ResizeObserver(scheduleRefresh);
   const observer = new MutationObserver(scheduleRefresh);
   observer.observe(document.documentElement, { childList: true, subtree: true });
   window.addEventListener("resize", scheduleRefresh);
-  window.__themeInjectRuntime = { version: VERSION, openPanel, destroy };
+  window.__themeInjectRuntime = { version: VERSION, openPanel, destroy: () => { cleanupCssInspector(); destroy(); } };
   ensurePanelStyles();
   const start = async () => { const lifecycle = lifecycleEpoch; await reloadState(); if (destroyed || lifecycle !== lifecycleEpoch) return; ensureTrigger(); };
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", () => { if (!destroyed) void start(); }, { once: true }); else void start();

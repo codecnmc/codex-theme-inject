@@ -195,7 +195,7 @@ pub async fn install(
                     } else {
                         None
                     };
-                    let generation_permit = if request.method == "ai.generate" {
+                    let generation_permit = if matches!(request.method.as_str(), "ai.generate" | "ai.resource.generate") {
                         match generation_permit.clone().try_acquire_owned() {
                             Ok(permit) => Some(permit),
                             Err(_) => {
@@ -225,7 +225,7 @@ pub async fn install(
                 }
             }
         }
-        tasks.abort_all();
+        tasks.detach_all();
         while tasks.join_next().await.is_some() {}
     });
     Ok(BridgeHandle {
@@ -344,16 +344,17 @@ struct PendingResponse {
 
 fn request_timeout(method: &str) -> Duration {
     match method {
-        "ai.generate" => GENERATION_REQUEST_TIMEOUT,
+        "ai.generate" | "ai.resource.generate" => GENERATION_REQUEST_TIMEOUT,
         "theme.package.import"
         | "theme.package.export"
         | "theme.background.import"
         | "theme.asset.import"
         | "ai.reference.import"
         | "ai.reference.upload" => FILE_REQUEST_TIMEOUT,
-        "theme.background.data" | "theme.preview.data" | "theme.preview.thumbnail" => {
-            DATA_URL_REQUEST_TIMEOUT
-        }
+        "theme.background.data"
+        | "theme.preview.data"
+        | "theme.preview.thumbnail"
+        | "theme.thumbnail" => DATA_URL_REQUEST_TIMEOUT,
         _ => DEFAULT_REQUEST_TIMEOUT,
     }
 }
@@ -386,10 +387,15 @@ fn valid_method(method: &str) -> bool {
             | "ai.reference.import"
             | "ai.reference.upload"
             | "ai.generate"
+            | "ai.resource.generate"
             | "theme.state.get"
+            | "app.trigger.save"
+            | "app.trigger.icon.import"
+            | "app.trigger.icon.reset"
             | "theme.package.list"
             | "theme.package.read"
             | "theme.package.create"
+            | "theme.package.metadata"
             | "theme.package.import"
             | "theme.package.export"
             | "theme.package.clone"
@@ -398,6 +404,7 @@ fn valid_method(method: &str) -> bool {
             | "theme.background.data"
             | "theme.preview.data"
             | "theme.preview.thumbnail"
+            | "theme.thumbnail"
             | "theme.asset.import"
             | "theme.preview.cancel"
             | "theme.activate"
@@ -421,6 +428,10 @@ mod tests {
     fn method_allowlist_is_closed() {
         assert!(valid_method("theme.apply"));
         assert!(valid_method("ai.generate"));
+        assert!(valid_method("ai.resource.generate"));
+        assert!(valid_method("app.trigger.save"));
+        assert!(valid_method("app.trigger.icon.import"));
+        assert!(valid_method("theme.package.metadata"));
         assert!(valid_method("ai.progress.get"));
         assert!(valid_method("ai.generation.restore"));
         assert!(valid_method("ai.generation.save"));

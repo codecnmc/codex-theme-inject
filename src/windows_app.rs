@@ -423,6 +423,7 @@ fn activate_packaged_blocking(app_user_model_id: &str, arguments: &str) -> anyho
             &HSTRING::from(arguments),
             ACTIVATEOPTIONS(0),
         );
+        drop(manager);
         if initialized {
             CoUninitialize();
         }

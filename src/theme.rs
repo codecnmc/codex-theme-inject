@@ -521,7 +521,7 @@ impl Default for Layout {
     fn default() -> Self {
         Self {
             density: 1.0,
-            sidebar_width: 280,
+            sidebar_width: 300,
             content_max_width: 960,
         }
     }

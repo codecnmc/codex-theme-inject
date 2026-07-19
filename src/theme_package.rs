@@ -42,6 +42,50 @@ impl ThemePackageManager {
         tokio::task::spawn_blocking(move || import_zip(&store, &path)).await?
     }
 
+    pub async fn import_trigger_icon(&self) -> anyhow::Result<()> {
+        let dialog = owned_dialog("选择主题入口图标")
+            .add_filter("Image", &["png", "jpg", "jpeg", "webp", "bmp"]);
+        let file = dialog.pick_file().await.context("未选择入口图标")?;
+        if fs::metadata(file.path())?.len() > MAX_FILE_BYTES {
+            bail!("入口图标超过 15 MB");
+        }
+        let image = image::open(file.path()).context("无法解码入口图标")?;
+        let image = image.resize(256, 256, FilterType::Lanczos3).to_rgba8();
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, ImageFormat::Png)
+            .context("无法编码入口图标")?;
+        atomic_write(&self.store.paths.trigger_icon, &bytes.into_inner())
+    }
+
+    pub fn reset_trigger_icon(&self) -> anyhow::Result<()> {
+        if self.store.paths.trigger_icon.exists() {
+            fs::remove_file(&self.store.paths.trigger_icon)?;
+        }
+        Ok(())
+    }
+
+    pub fn update_metadata(
+        &self,
+        id: &str,
+        name: &str,
+        description: &str,
+    ) -> anyhow::Result<ThemeManifest> {
+        let name = name.trim();
+        let description = description.trim();
+        if name.is_empty() || name.chars().count() > 80 {
+            bail!("主题名称不能为空且不能超过 80 个字符");
+        }
+        if description.chars().count() > 240 {
+            bail!("主题介绍不能超过 240 个字符");
+        }
+        let mut theme = self.store.load(id)?;
+        theme.name = name.into();
+        theme.description = description.into();
+        self.store.save(&theme)?;
+        Ok(theme)
+    }
+
     pub async fn export_dialog(&self, id: String) -> anyhow::Result<()> {
         let dialog = owned_dialog("导出 Theme Inject 主题包")
             .set_file_name(format!("{id}.zip"))
@@ -222,20 +266,36 @@ impl ThemePackageManager {
         {
             bail!("预览图片无效或超过 15 MB");
         }
-        let image = image::open(&path).context("无法解码预览图片")?;
-        let thumbnail = if image.width() > 256 || image.height() > 256 {
-            image.resize(256, 256, FilterType::Triangle)
-        } else {
-            image
-        };
-        let mut bytes = std::io::Cursor::new(Vec::new());
-        DynamicImage::ImageRgba8(thumbnail.to_rgba8())
-            .write_to(&mut bytes, ImageFormat::Png)
-            .context("无法编码预览缩略图")?;
-        Ok(format!(
-            "data:image/png;base64,{}",
-            base64::engine::general_purpose::STANDARD.encode(bytes.into_inner())
-        ))
+        thumbnail_data_url(&path, 256)
+    }
+
+    pub fn theme_thumbnail_data_url(
+        &self,
+        theme_id: &str,
+        relative: &str,
+    ) -> anyhow::Result<String> {
+        crate::theme::validate_theme_id(theme_id)?;
+        crate::theme::validate_relative_asset_path(relative)?;
+        let theme = self.store.load(theme_id)?;
+        if theme.skin.resources.hero_image.as_deref() != Some(relative) {
+            bail!("缩略图资源不是当前主题的 Hero 图片");
+        }
+        let root = self.store.paths.themes.canonicalize()?;
+        let path = self
+            .store
+            .paths
+            .themes
+            .join(theme_id)
+            .join(relative)
+            .canonicalize()
+            .context("主题 Hero 图片不存在")?;
+        if !path.starts_with(&root)
+            || !path.is_file()
+            || fs::metadata(&path)?.len() > MAX_FILE_BYTES
+        {
+            bail!("主题 Hero 图片无效或超过 15 MB");
+        }
+        thumbnail_data_url(&path, 128)
     }
 
     pub fn promote_image(
@@ -324,6 +384,23 @@ impl ThemePackageManager {
         }
         Ok(serde_json::from_slice(&fs::read(&self.store.paths.trust)?)?)
     }
+}
+
+fn thumbnail_data_url(path: &Path, max_dimension: u32) -> anyhow::Result<String> {
+    let image = image::open(path).context("无法解码预览图片")?;
+    let thumbnail = if image.width() > max_dimension || image.height() > max_dimension {
+        image.resize(max_dimension, max_dimension, FilterType::Triangle)
+    } else {
+        image
+    };
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(thumbnail.to_rgba8())
+        .write_to(&mut bytes, ImageFormat::Png)
+        .context("无法编码预览缩略图")?;
+    Ok(format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes.into_inner())
+    ))
 }
 
 fn owned_dialog(title: &str) -> rfd::AsyncFileDialog {
@@ -601,6 +678,36 @@ mod tests {
         let thumbnail = image::load_from_memory(&bytes).unwrap();
         assert!(thumbnail.width() <= 256 && thumbnail.height() <= 256);
         assert!(thumbnail.color().has_alpha());
+    }
+
+    #[test]
+    fn theme_thumbnail_tracks_current_hero_path() {
+        let (_temp, store) = theme_store();
+        let manager = ThemePackageManager::new(store.clone());
+        let mut theme = ThemeManifest::neutral_dark();
+        theme.id = "local.thumbnail".into();
+        theme.skin.enabled = true;
+        theme.skin.resources.hero_image = Some("assets/hero.png".into());
+        let root = store.paths.themes.join(&theme.id);
+        fs::create_dir_all(root.join("assets")).unwrap();
+        DynamicImage::ImageRgba8(image::RgbaImage::new(640, 360))
+            .save(root.join("assets/hero.png"))
+            .unwrap();
+        store.save(&theme).unwrap();
+
+        let data_url = manager
+            .theme_thumbnail_data_url(&theme.id, "assets/hero.png")
+            .unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data_url.split_once(',').unwrap().1)
+            .unwrap();
+        let thumbnail = image::load_from_memory(&bytes).unwrap();
+        assert!(thumbnail.width() <= 128 && thumbnail.height() <= 128);
+        assert!(
+            manager
+                .theme_thumbnail_data_url(&theme.id, "assets/old-hero.png")
+                .is_err()
+        );
     }
 
     #[test]

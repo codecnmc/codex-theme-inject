@@ -9,10 +9,10 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc};
 
-use crate::ai::{AiPublicSettings, AiThemeService, GenerateRequest};
+use crate::ai::{AiPublicSettings, AiThemeService, GenerateRequest, GenerateResourceRequest};
 use crate::asset_server::AssetServer;
 use crate::bridge::{BridgeHandle, RpcHandler};
-use crate::storage::{AppPaths, SettingsStore, ThemeStore};
+use crate::storage::{AppPaths, SettingsStore, ThemeStore, TriggerAppearance};
 use crate::theme::ThemeManifest;
 use crate::theme_package::ThemePackageManager;
 
@@ -137,6 +137,7 @@ impl ThemeLauncher {
         app_settings.last_codex_version = app.version().to_string();
         self.settings.save(&app_settings)?;
         let reinject_requested = Arc::new(AtomicBool::new(false));
+        let generation_active = Arc::new(AtomicBool::new(false));
         let ai = AiThemeService::new(
             self.themes.paths.clone(),
             asset_server.base_url(),
@@ -150,6 +151,7 @@ impl ThemeLauncher {
             asset_token: asset_server.token.clone(),
             state_lock: Mutex::new(()),
             reinject_requested: reinject_requested.clone(),
+            generation_active: generation_active.clone(),
         });
         let handler = rpc_handler(service);
         let script = runtime_script()?;
@@ -166,6 +168,7 @@ impl ThemeLauncher {
             script,
             handler,
             reinject_requested,
+            generation_active,
         };
         crate::diagnostic::log(
             "launcher.bridge_ready",
@@ -205,7 +208,7 @@ impl ThemeLauncher {
                 _ = interval.tick() => {
                     if !crate::windows_app::codex_is_running() {
                         process_missing_ticks += 1;
-                        if process_missing_ticks >= 2 { break; }
+                        if process_missing_ticks >= 2 && !runtime.generation_active.load(Ordering::SeqCst) { break; }
                     } else {
                         process_missing_ticks = 0;
                     }
@@ -377,6 +380,7 @@ struct ThemeService {
     asset_token: String,
     state_lock: Mutex<()>,
     reinject_requested: Arc<AtomicBool>,
+    generation_active: Arc<AtomicBool>,
 }
 
 struct RuntimeInstall {
@@ -384,6 +388,7 @@ struct RuntimeInstall {
     script: String,
     handler: RpcHandler,
     reinject_requested: Arc<AtomicBool>,
+    generation_active: Arc<AtomicBool>,
 }
 
 fn rpc_handler(service: Arc<ThemeService>) -> RpcHandler {
@@ -395,7 +400,7 @@ fn rpc_handler(service: Arc<ThemeService>) -> RpcHandler {
 
 impl ThemeService {
     async fn call(&self, method: &str, params: Value) -> anyhow::Result<Value> {
-        let _guard = if method == "ai.generate" {
+        let _guard = if matches!(method, "ai.generate" | "ai.resource.generate") {
             None
         } else {
             Some(self.state_lock.lock().await)
@@ -406,7 +411,16 @@ impl ThemeService {
             "ai.settings.get" => Ok(serde_json::to_value(self.ai.public_settings()?)?),
             "ai.log.get" => Ok(serde_json::to_value(self.ai.request_log())?),
             "ai.progress.get" => Ok(serde_json::to_value(self.ai.generation_progress())?),
-            "ai.generation.restore" => Ok(serde_json::to_value(self.ai.restore_checkpoint()?)?),
+            "ai.generation.restore" => {
+                let restored = if params.get("prompt").is_some() {
+                    let request: GenerateRequest =
+                        serde_json::from_value(params).context("恢复生成参数格式无效")?;
+                    self.ai.restore_checkpoint_matching(request)?
+                } else {
+                    self.ai.restore_checkpoint()?
+                };
+                Ok(serde_json::to_value(restored)?)
+            }
             "ai.settings.save" => {
                 let settings: AiPublicSettings = serde_json::from_value(
                     params
@@ -467,10 +481,41 @@ impl ThemeService {
             "ai.generate" => {
                 let request: GenerateRequest =
                     serde_json::from_value(params).context("AI 生成参数格式无效")?;
-                Ok(serde_json::to_value(self.ai.generate(request).await?)?)
+                let _generation_guard = GenerationActiveGuard::acquire(&self.generation_active)?;
+                let result = self.ai.generate(request).await;
+                Ok(serde_json::to_value(result?)?)
+            }
+            "ai.resource.generate" => {
+                let request: GenerateResourceRequest =
+                    serde_json::from_value(params).context("AI 单资源生成参数格式无效")?;
+                let _generation_guard = GenerationActiveGuard::acquire(&self.generation_active)?;
+                let result = self.ai.generate_resource(request).await;
+                Ok(serde_json::to_value(result?)?)
             }
             "ai.generation.save" => self.save_generated_theme(params),
             "theme.state.get" => self.state_value(),
+            "app.trigger.save" => {
+                let appearance: TriggerAppearance = serde_json::from_value(
+                    params
+                        .get("appearance")
+                        .cloned()
+                        .context("缺少入口外观设置")?,
+                )
+                .context("入口外观设置格式无效")?;
+                appearance.validate()?;
+                let mut settings = self.settings.load()?;
+                settings.trigger_appearance = appearance;
+                self.settings.save(&settings)?;
+                self.state_value()
+            }
+            "app.trigger.icon.import" => {
+                packages.import_trigger_icon().await?;
+                self.state_value()
+            }
+            "app.trigger.icon.reset" => {
+                packages.reset_trigger_icon()?;
+                self.state_value()
+            }
             "theme.package.list" => Ok(serde_json::to_value(self.themes.list()?)?),
             "theme.package.read" => {
                 let theme = self.themes.load(string_param(&params, "id")?)?;
@@ -485,6 +530,11 @@ impl ThemeService {
                 )?;
                 Ok(serde_json::to_value(theme)?)
             }
+            "theme.package.metadata" => Ok(serde_json::to_value(packages.update_metadata(
+                string_param(&params, "id")?,
+                string_param(&params, "name")?,
+                string_param(&params, "description")?,
+            )?)?),
             "theme.package.import" => Ok(serde_json::to_value(packages.import_dialog().await?)?),
             "theme.package.export" => {
                 packages
@@ -535,6 +585,12 @@ impl ThemeService {
             "theme.preview.thumbnail" => Ok(json!({
                 "url": packages.staging_thumbnail_data_url(
                     string_param(&params, "session")?,
+                    string_param(&params, "path")?,
+                )?
+            })),
+            "theme.thumbnail" => Ok(json!({
+                "url": packages.theme_thumbnail_data_url(
+                    string_param(&params, "id")?,
                     string_param(&params, "path")?,
                 )?
             })),
@@ -597,10 +653,20 @@ impl ThemeService {
         let manager = ThemePackageManager::new(self.themes.clone());
         let custom_css_trusted = manager.custom_css_trusted(&active)?;
         let custom_css = self.themes.custom_css(&active)?;
+        let trigger_icon = if self.themes.paths.trigger_icon.is_file() {
+            Some(format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD
+                    .encode(std::fs::read(&self.themes.paths.trigger_icon)?)
+            ))
+        } else {
+            None
+        };
         Ok(json!({
             "settings": settings,
             "activeTheme": active,
             "themes": self.themes.list()?,
+            "triggerIcon": trigger_icon,
             "assetBase": self.asset_base,
             "assetToken": self.asset_token,
             "customCssTrusted": custom_css_trusted,
@@ -734,6 +800,30 @@ impl ThemeService {
     }
 }
 
+struct GenerationActiveGuard {
+    active: Arc<AtomicBool>,
+}
+
+impl GenerationActiveGuard {
+    fn acquire(active: &Arc<AtomicBool>) -> anyhow::Result<Self> {
+        if active
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            bail!("已有 AI 主题生成任务正在运行");
+        }
+        Ok(Self {
+            active: active.clone(),
+        })
+    }
+}
+
+impl Drop for GenerationActiveGuard {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::SeqCst);
+    }
+}
+
 fn string_param<'a>(params: &'a Value, key: &str) -> anyhow::Result<&'a str> {
     params
         .get(key)
@@ -750,8 +840,17 @@ fn available_port() -> anyhow::Result<u16> {
 fn runtime_script() -> anyhow::Result<String> {
     let script = include_str!("../assets/theme-runtime.js");
     let css = include_str!("../assets/theme-panel.css");
-    Ok(script.replace(
-        "__THEME_INJECT_PANEL_CSS_JSON__",
-        &serde_json::to_string(css)?,
-    ))
+    let icon = format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(include_bytes!("../assets/icon.png"))
+    );
+    Ok(script
+        .replace(
+            "__THEME_INJECT_PANEL_CSS_JSON__",
+            &serde_json::to_string(css)?,
+        )
+        .replace(
+            "__THEME_INJECT_ICON_DATA_URL_JSON__",
+            &serde_json::to_string(&icon)?,
+        ))
 }
