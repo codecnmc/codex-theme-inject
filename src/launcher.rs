@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -137,7 +138,16 @@ impl ThemeLauncher {
         app_settings.last_codex_version = app.version().to_string();
         self.settings.save(&app_settings)?;
         let reinject_requested = Arc::new(AtomicBool::new(false));
+        let restart_requested = Arc::new(AtomicBool::new(false));
         let generation_active = Arc::new(AtomicBool::new(false));
+        let mut relaunch_args = vec![
+            "--debug-port".to_string(),
+            debug_port.to_string(),
+            "--open-panel".to_string(),
+        ];
+        if let Some(path) = &options.app_path {
+            relaunch_args.extend(["--app-path".to_string(), path.display().to_string()]);
+        }
         let ai = AiThemeService::new(
             self.themes.paths.clone(),
             asset_server.base_url(),
@@ -150,7 +160,8 @@ impl ThemeLauncher {
             asset_base: asset_server.base_url(),
             asset_token: asset_server.token.clone(),
             state_lock: Mutex::new(()),
-            reinject_requested: reinject_requested.clone(),
+            restart_requested: restart_requested.clone(),
+            relaunch_args,
             generation_active: generation_active.clone(),
         });
         let handler = rpc_handler(service);
@@ -168,6 +179,7 @@ impl ThemeLauncher {
             script,
             handler,
             reinject_requested,
+            restart_requested,
             generation_active,
         };
         crate::diagnostic::log(
@@ -206,6 +218,7 @@ impl ThemeLauncher {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
+                    if runtime.restart_requested.swap(false, Ordering::SeqCst) { break; }
                     if !crate::windows_app::codex_is_running() {
                         process_missing_ticks += 1;
                         if process_missing_ticks >= 2 && !runtime.generation_active.load(Ordering::SeqCst) { break; }
@@ -379,7 +392,8 @@ struct ThemeService {
     asset_base: String,
     asset_token: String,
     state_lock: Mutex<()>,
-    reinject_requested: Arc<AtomicBool>,
+    restart_requested: Arc<AtomicBool>,
+    relaunch_args: Vec<String>,
     generation_active: Arc<AtomicBool>,
 }
 
@@ -388,6 +402,7 @@ struct RuntimeInstall {
     script: String,
     handler: RpcHandler,
     reinject_requested: Arc<AtomicBool>,
+    restart_requested: Arc<AtomicBool>,
     generation_active: Arc<AtomicBool>,
 }
 
@@ -400,7 +415,10 @@ fn rpc_handler(service: Arc<ThemeService>) -> RpcHandler {
 
 impl ThemeService {
     async fn call(&self, method: &str, params: Value) -> anyhow::Result<Value> {
-        let _guard = if matches!(method, "ai.generate" | "ai.resource.generate") {
+        let _guard = if matches!(
+            method,
+            "ai.generate" | "ai.resource.generate" | "ai.generation.cancel"
+        ) {
             None
         } else {
             Some(self.state_lock.lock().await)
@@ -408,9 +426,20 @@ impl ThemeService {
         let packages = ThemePackageManager::new(self.themes.clone());
         match method {
             "theme.health" => Ok(json!({ "status": "ok", "version": 1 })),
+            "theme.window.chrome" => {
+                crate::windows_app::apply_foreground_window_chrome(
+                    string_param(&params, "background")?,
+                    string_param(&params, "foreground")?,
+                )?;
+                Ok(json!({ "applied": true }))
+            }
             "ai.settings.get" => Ok(serde_json::to_value(self.ai.public_settings()?)?),
             "ai.log.get" => Ok(serde_json::to_value(self.ai.request_log())?),
             "ai.progress.get" => Ok(serde_json::to_value(self.ai.generation_progress())?),
+            "ai.generation.cancel" => {
+                self.ai.cancel_generation();
+                Ok(json!({ "cancelled": true }))
+            }
             "ai.generation.restore" => {
                 let restored = if params.get("prompt").is_some() {
                     let request: GenerateRequest =
@@ -632,10 +661,7 @@ impl ThemeService {
                 packages.revoke_custom_css(string_param(&params, "id")?)?;
                 Ok(json!({ "trusted": false }))
             }
-            "runtime.reinject" => {
-                self.reinject_requested.store(true, Ordering::SeqCst);
-                Ok(json!({ "status": "scheduled" }))
-            }
+            "runtime.reinject" => self.rebuild_and_restart_dev().await,
             "diagnostics.report" => {
                 crate::diagnostic::log("renderer.report", params);
                 Ok(json!({ "status": "recorded" }))
@@ -671,8 +697,68 @@ impl ThemeService {
             "assetToken": self.asset_token,
             "customCssTrusted": custom_css_trusted,
             "customCss": custom_css,
-            "ai": self.ai.public_settings()?
+            "ai": self.ai.public_settings()?,
+            "development": cfg!(debug_assertions)
         }))
+    }
+
+    async fn rebuild_and_restart_dev(&self) -> anyhow::Result<Value> {
+        if !cfg!(debug_assertions) {
+            bail!("重新注入仅在开发构建中可用");
+        }
+        let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let current = std::env::current_exe().context("无法定位当前开发可执行文件")?;
+        let next_slot = next_dev_slot(&current, &project_root);
+        let target_dir = project_root
+            .join("target")
+            .join(format!("theme-inject-dev-{next_slot}"));
+        let executable = target_dir.join("debug").join("theme-inject.exe");
+        crate::diagnostic::log(
+            "runtime.dev_rebuild_started",
+            json!({ "slot": next_slot, "targetDir": target_dir }),
+        );
+        let output = tokio::process::Command::new("cargo")
+            .args(["build", "--target-dir"])
+            .arg(&target_dir)
+            .current_dir(&project_root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .context("无法启动 cargo build")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "构建备用开发版本失败：{}",
+                stderr
+                    .chars()
+                    .rev()
+                    .take(1600)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>()
+            );
+        }
+        if !executable.is_file() {
+            bail!("构建完成但未找到 {}", executable.display());
+        }
+        std::fs::write(
+            project_root
+                .join("target")
+                .join("theme-inject-dev-slot.txt"),
+            next_slot,
+        )
+        .context("无法记录下次开发构建槽位")?;
+        schedule_dev_relaunch(std::process::id(), &executable, &self.relaunch_args)?;
+        self.restart_requested.store(true, Ordering::SeqCst);
+        crate::diagnostic::log(
+            "runtime.dev_rebuild_ready",
+            json!({ "slot": next_slot, "executable": executable }),
+        );
+        Ok(
+            json!({ "status": "restarting", "slot": next_slot, "message": format!("已构建开发槽位 {}，正在重启并重新注入", next_slot.to_ascii_uppercase()) }),
+        )
     }
 
     fn apply_theme(&self, params: Value) -> anyhow::Result<Value> {
@@ -835,6 +921,62 @@ fn string_param<'a>(params: &'a Value, key: &str) -> anyhow::Result<&'a str> {
 fn available_port() -> anyhow::Result<u16> {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
     Ok(listener.local_addr()?.port())
+}
+
+fn next_dev_slot(
+    current_executable: &std::path::Path,
+    project_root: &std::path::Path,
+) -> &'static str {
+    let path = current_executable.to_string_lossy().to_ascii_lowercase();
+    if path.contains("theme-inject-dev-a") {
+        return "b";
+    }
+    if path.contains("theme-inject-dev-b") {
+        return "a";
+    }
+    let marker = project_root
+        .join("target")
+        .join("theme-inject-dev-slot.txt");
+    match std::fs::read_to_string(marker)
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some("a") => "b",
+        _ => "a",
+    }
+}
+
+fn schedule_dev_relaunch(
+    parent_pid: u32,
+    executable: &std::path::Path,
+    args: &[String],
+) -> anyhow::Result<()> {
+    let quote = |value: &str| format!("'{}'", value.replace('\'', "''"));
+    let argument_list = args
+        .iter()
+        .map(|value| quote(value))
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = format!(
+        "$ErrorActionPreference='Stop'; while (Get-Process -Id {parent_pid} -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 100 }}; Start-Process -WindowStyle Hidden -FilePath {} -ArgumentList @({argument_list})",
+        quote(&executable.display().to_string())
+    );
+    std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            &script,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("无法安排备用开发版本启动")?;
+    Ok(())
 }
 
 fn runtime_script() -> anyhow::Result<String> {
