@@ -48,6 +48,177 @@ pub fn foreground_dialog_parent() -> Option<DialogParent> {
     (!window.is_invalid()).then_some(DialogParent(window))
 }
 
+#[cfg(windows)]
+pub fn apply_foreground_window_chrome(background: &str, foreground: &str) -> anyhow::Result<()> {
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows::Win32::Graphics::Dwm::{DWMWINDOWATTRIBUTE, DwmSetWindowAttribute};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowThreadProcessId, IsWindowVisible,
+    };
+
+    let caption = colorref(background)?;
+    let text = colorref(&accessible_caption_foreground(background, foreground)?)?;
+    let dark = i32::from(relative_luminance(background)? < 0.5);
+    let process_ids = codex_process_ids();
+    if process_ids.is_empty() {
+        bail!("未找到 Codex 进程");
+    }
+    struct WindowChrome<'a> {
+        process_ids: &'a [u32],
+        caption: u32,
+        text: u32,
+        dark: i32,
+        applied: usize,
+        unsupported_color: usize,
+    }
+    unsafe extern "system" fn apply(window: HWND, parameter: LPARAM) -> BOOL {
+        let state = unsafe { &mut *(parameter.0 as *mut WindowChrome<'_>) };
+        let mut process_id = 0;
+        unsafe { GetWindowThreadProcessId(window, Some(&mut process_id)) };
+        if state.process_ids.contains(&process_id) && unsafe { IsWindowVisible(window).as_bool() } {
+            let dark_result = unsafe {
+                DwmSetWindowAttribute(
+                    window,
+                    DWMWINDOWATTRIBUTE(20),
+                    &state.dark as *const i32 as _,
+                    4,
+                )
+            };
+            let caption_result = unsafe {
+                DwmSetWindowAttribute(
+                    window,
+                    DWMWINDOWATTRIBUTE(35),
+                    &state.caption as *const u32 as _,
+                    4,
+                )
+            };
+            let text_result = unsafe {
+                DwmSetWindowAttribute(
+                    window,
+                    DWMWINDOWATTRIBUTE(36),
+                    &state.text as *const u32 as _,
+                    4,
+                )
+            };
+            if dark_result.is_ok() || caption_result.is_ok() || text_result.is_ok() {
+                state.applied += 1;
+            }
+            if caption_result.is_err() || text_result.is_err() {
+                state.unsupported_color += 1;
+            }
+        }
+        BOOL(1)
+    }
+    let mut state = WindowChrome {
+        process_ids: &process_ids,
+        caption,
+        text,
+        dark,
+        applied: 0,
+        unsupported_color: 0,
+    };
+    unsafe {
+        EnumWindows(
+            Some(apply),
+            LPARAM(&mut state as *mut WindowChrome<'_> as isize),
+        )?;
+    }
+    if state.applied == 0 {
+        bail!("Windows 未接受 Codex 标题栏深浅模式设置");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn codex_process_ids() -> Vec<u32> {
+    use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    unsafe {
+        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return Vec::new();
+        };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Vec::new();
+        }
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut ids = Vec::new();
+        if Process32FirstW(snapshot, &mut entry).is_ok() {
+            loop {
+                let length = entry
+                    .szExeFile
+                    .iter()
+                    .position(|value| *value == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let name = String::from_utf16_lossy(&entry.szExeFile[..length]);
+                if name.eq_ignore_ascii_case("ChatGPT.exe")
+                    || name.eq_ignore_ascii_case("Codex.exe")
+                {
+                    ids.push(entry.th32ProcessID);
+                }
+                if Process32NextW(snapshot, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snapshot);
+        ids
+    }
+}
+
+#[cfg(not(windows))]
+pub fn apply_foreground_window_chrome(_background: &str, _foreground: &str) -> anyhow::Result<()> {
+    Ok(())
+}
+
+fn colorref(value: &str) -> anyhow::Result<u32> {
+    let value = value.strip_prefix('#').context("窗口颜色格式无效")?;
+    if value.len() != 6 {
+        bail!("窗口颜色格式无效");
+    }
+    let red = u32::from_str_radix(&value[0..2], 16)?;
+    let green = u32::from_str_radix(&value[2..4], 16)?;
+    let blue = u32::from_str_radix(&value[4..6], 16)?;
+    Ok(red | (green << 8) | (blue << 16))
+}
+
+fn relative_luminance(value: &str) -> anyhow::Result<f32> {
+    let color = colorref(value)?;
+    let channel = |value: u32| {
+        let value = value as f32 / 255.0;
+        if value <= 0.03928 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    Ok(channel(color & 0xff) * 0.2126
+        + channel((color >> 8) & 0xff) * 0.7152
+        + channel((color >> 16) & 0xff) * 0.0722)
+}
+
+fn accessible_caption_foreground(background: &str, requested: &str) -> anyhow::Result<String> {
+    let background_luminance = relative_luminance(background)?;
+    let requested_luminance = relative_luminance(requested)?;
+    if contrast_ratio(background_luminance, requested_luminance) >= 4.5 {
+        return Ok(requested.to_ascii_uppercase());
+    }
+    let black = contrast_ratio(background_luminance, 0.0);
+    let white = contrast_ratio(background_luminance, 1.0);
+    Ok(if white >= black { "#FFFFFF" } else { "#000000" }.into())
+}
+
+fn contrast_ratio(left: f32, right: f32) -> f32 {
+    let lighter = left.max(right);
+    let darker = left.min(right);
+    (lighter + 0.05) / (darker + 0.05)
+}
+
 #[cfg(not(windows))]
 pub struct DialogParent;
 
@@ -461,5 +632,21 @@ mod tests {
     #[test]
     fn version_sort_key_is_numeric() {
         assert!(version_key("26.707.10.0") > version_key("26.99.9999.0"));
+    }
+
+    #[test]
+    fn caption_foreground_keeps_window_buttons_readable() {
+        assert_eq!(
+            accessible_caption_foreground("#000000", "#26282D").unwrap(),
+            "#FFFFFF"
+        );
+        assert_eq!(
+            accessible_caption_foreground("#FFFFFF", "#F7FAFF").unwrap(),
+            "#000000"
+        );
+        assert_eq!(
+            accessible_caption_foreground("#000000", "#F7FAFF").unwrap(),
+            "#F7FAFF"
+        );
     }
 }

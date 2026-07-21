@@ -248,6 +248,26 @@ pub struct ChromeTheme {
     pub sidebar_active: Option<String>,
     #[serde(default)]
     pub sidebar_active_foreground: Option<String>,
+    #[serde(default)]
+    pub right_sidebar_background: Option<String>,
+    #[serde(default)]
+    pub right_sidebar_foreground: Option<String>,
+    #[serde(default)]
+    pub right_sidebar_muted_foreground: Option<String>,
+    #[serde(default)]
+    pub right_sidebar_icon: Option<String>,
+    #[serde(default)]
+    pub right_sidebar_border: Option<String>,
+    #[serde(default)]
+    pub right_sidebar_hover: Option<String>,
+    #[serde(default)]
+    pub right_sidebar_active: Option<String>,
+    #[serde(default)]
+    pub right_sidebar_active_foreground: Option<String>,
+    #[serde(default)]
+    pub right_sidebar_shortcut_background: Option<String>,
+    #[serde(default)]
+    pub right_sidebar_shortcut_foreground: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -277,6 +297,8 @@ pub struct BrandStyle {
     #[serde(default)]
     pub subtitle: String,
     #[serde(default)]
+    pub account_name: String,
+    #[serde(default)]
     pub font: String,
 }
 
@@ -285,6 +307,8 @@ pub struct BrandStyle {
 pub struct SkinResources {
     #[serde(default)]
     pub logo: Option<String>,
+    #[serde(default)]
+    pub account_avatar: Option<String>,
     #[serde(default)]
     pub sidebar_watermark: Option<String>,
     #[serde(default)]
@@ -550,6 +574,31 @@ pub struct Effects {
     pub background_blur: u16,
     pub saturation: f32,
     pub panel_opacity: f32,
+    #[serde(default)]
+    pub ambient_enabled: bool,
+    #[serde(default = "default_ambient_effect")]
+    pub ambient_effect: String,
+    #[serde(default = "default_ambient_intensity")]
+    pub ambient_intensity: f32,
+    #[serde(default = "default_ambient_speed")]
+    pub ambient_speed: f32,
+    #[serde(default = "default_ambient_opacity")]
+    pub ambient_opacity: f32,
+    #[serde(default)]
+    pub ambient_color: Option<String>,
+}
+
+fn default_ambient_effect() -> String {
+    "snow".into()
+}
+fn default_ambient_intensity() -> f32 {
+    0.5
+}
+fn default_ambient_speed() -> f32 {
+    1.0
+}
+fn default_ambient_opacity() -> f32 {
+    0.65
 }
 
 impl Default for Effects {
@@ -559,6 +608,12 @@ impl Default for Effects {
             background_blur: 0,
             saturation: 1.0,
             panel_opacity: 1.0,
+            ambient_enabled: false,
+            ambient_effect: default_ambient_effect(),
+            ambient_intensity: default_ambient_intensity(),
+            ambient_speed: default_ambient_speed(),
+            ambient_opacity: default_ambient_opacity(),
+            ambient_color: None,
         }
     }
 }
@@ -621,6 +676,7 @@ impl ThemeManifest {
             .colors()
             .into_iter()
             .chain(self.terminal.colors())
+            .chain(self.effects.ambient_color.as_deref())
         {
             validate_color(color)?;
         }
@@ -635,6 +691,13 @@ impl ThemeManifest {
             || self.effects.background_blur > 80
             || !(0.5..=2.0).contains(&self.effects.saturation)
             || !(0.25..=1.0).contains(&self.effects.panel_opacity)
+            || !matches!(
+                self.effects.ambient_effect.as_str(),
+                "meteor" | "rain" | "snow" | "stars" | "fireflies" | "petals"
+            )
+            || !(0.1..=1.0).contains(&self.effects.ambient_intensity)
+            || !(0.25..=2.5).contains(&self.effects.ambient_speed)
+            || !(0.1..=1.0).contains(&self.effects.ambient_opacity)
         {
             bail!("主题数值超出允许范围");
         }
@@ -760,6 +823,7 @@ impl ThemeManifest {
             background_blur: 12,
             saturation: 1.05,
             panel_opacity: 0.9,
+            ..Effects::default()
         };
         theme.shape.radius = 14;
         theme
@@ -867,6 +931,16 @@ impl ChromeTheme {
             &self.sidebar_hover,
             &self.sidebar_active,
             &self.sidebar_active_foreground,
+            &self.right_sidebar_background,
+            &self.right_sidebar_foreground,
+            &self.right_sidebar_muted_foreground,
+            &self.right_sidebar_icon,
+            &self.right_sidebar_border,
+            &self.right_sidebar_hover,
+            &self.right_sidebar_active,
+            &self.right_sidebar_active_foreground,
+            &self.right_sidebar_shortcut_background,
+            &self.right_sidebar_shortcut_foreground,
         ]
         .into_iter()
         .flatten()
@@ -881,6 +955,7 @@ impl SkinTheme {
     fn validate(&self) -> anyhow::Result<()> {
         validate_short_text(&self.brand.title, 80, "品牌名称")?;
         validate_short_text(&self.brand.subtitle, 160, "品牌副标题")?;
+        validate_short_text(&self.brand.account_name, 80, "左下角名称")?;
         if !self.brand.font.is_empty() {
             validate_font_stack(&self.brand.font)?;
         }
@@ -908,6 +983,7 @@ impl SkinResources {
     pub fn paths(&self) -> impl Iterator<Item = &str> {
         [
             self.logo.as_deref(),
+            self.account_avatar.as_deref(),
             self.sidebar_watermark.as_deref(),
             self.hero_image.as_deref(),
             self.hero_badge.as_deref(),
@@ -1185,6 +1261,79 @@ mod tests {
         ] {
             theme.validate().unwrap();
         }
+    }
+
+    #[test]
+    fn ambient_effect_defaults_and_validation_are_stable() {
+        let theme = ThemeManifest::neutral_dark();
+        assert!(!theme.effects.ambient_enabled);
+        assert_eq!(theme.effects.ambient_effect, "snow");
+        assert_eq!(theme.effects.ambient_color, None);
+        let mut invalid = theme;
+        invalid.effects.ambient_effect = "unknown".into();
+        assert!(invalid.validate().is_err());
+
+        let mut invalid_color = ThemeManifest::neutral_dark();
+        invalid_color.effects.ambient_color = Some("currentColor".into());
+        assert!(invalid_color.validate().is_err());
+    }
+
+    #[test]
+    fn right_sidebar_colors_round_trip_and_validate() {
+        let mut theme = ThemeManifest::neutral_dark();
+        theme.chrome.right_sidebar_background = Some("#101820".into());
+        theme.chrome.right_sidebar_foreground = Some("#F4F7FB".into());
+        theme.chrome.right_sidebar_muted_foreground = Some("#A9B7CA".into());
+        theme.chrome.right_sidebar_icon = Some("#F4F7FB".into());
+        theme.chrome.right_sidebar_border = Some("#60728A".into());
+        theme.chrome.right_sidebar_hover = Some("#24324A".into());
+        theme.chrome.right_sidebar_active = Some("#33445D".into());
+        theme.chrome.right_sidebar_active_foreground = Some("#FFFFFF".into());
+        theme.chrome.right_sidebar_shortcut_background = Some("#172235".into());
+        theme.chrome.right_sidebar_shortcut_foreground = Some("#B8C6D8".into());
+        let value = serde_json::to_value(&theme).unwrap();
+        let restored = ThemeManifest::from_value_migrated(value).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored.chrome, theme.chrome);
+
+        theme.chrome.right_sidebar_background = Some("transparent".into());
+        assert!(theme.validate().is_err());
+    }
+
+    #[test]
+    fn account_branding_round_trips_and_defaults_for_older_themes() {
+        let mut theme = ThemeManifest::neutral_dark();
+        theme.skin.brand.account_name = "主题账户".into();
+        theme.skin.resources.account_avatar = Some("assets/account-avatar.png".into());
+        let value = serde_json::to_value(&theme).unwrap();
+        assert_eq!(value["skin"]["brand"]["accountName"], "主题账户");
+        assert_eq!(
+            value["skin"]["resources"]["accountAvatar"],
+            "assets/account-avatar.png"
+        );
+        let restored = ThemeManifest::from_value_migrated(value).unwrap();
+        assert_eq!(restored.skin.brand.account_name, "主题账户");
+        assert_eq!(
+            restored.skin.resources.account_avatar.as_deref(),
+            Some("assets/account-avatar.png")
+        );
+
+        let mut legacy = serde_json::to_value(ThemeManifest::neutral_dark()).unwrap();
+        legacy["skin"]["brand"]
+            .as_object_mut()
+            .unwrap()
+            .remove("accountName");
+        legacy["skin"]["resources"]
+            .as_object_mut()
+            .unwrap()
+            .remove("accountAvatar");
+        let restored = ThemeManifest::from_value_migrated(legacy).unwrap();
+        assert!(restored.skin.brand.account_name.is_empty());
+        assert!(restored.skin.resources.account_avatar.is_none());
+
+        let mut invalid = ThemeManifest::neutral_dark();
+        invalid.skin.brand.account_name = "名".repeat(81);
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

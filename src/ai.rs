@@ -1,7 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex as StdMutex;
+use std::sync::{
+    Mutex as StdMutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
@@ -36,8 +40,10 @@ const MAX_GENERATED_SIDEBAR_WIDTH: u16 = 360;
 const IMAGE_GENERATION_CONCURRENCY: usize = 4;
 const MAX_IMAGE_GENERATION_CONCURRENCY: usize = 4;
 const MAX_AI_REQUEST_CONCURRENCY: usize = 5;
-const MAX_IMAGE_RATE_LIMIT_RETRIES: usize = 8;
-const ICON_ACTIONS: [(&str, &str); 9] = [
+const MAX_IMAGE_ATTEMPTS: usize = 3;
+const ICON_ATLAS_COLUMNS: u32 = 6;
+const ICON_ATLAS_ROWS: u32 = 5;
+const ICON_ACTIONS: [(&str, &str); 30] = [
     ("sidebar-toggle", "toggle the application sidebar"),
     ("new-task", "create a new coding task"),
     ("search", "search"),
@@ -47,6 +53,27 @@ const ICON_ACTIONS: [(&str, &str); 9] = [
     ("settings", "settings and preferences"),
     ("send", "send a message"),
     ("terminal", "terminal and command line"),
+    ("files", "files and folders"),
+    ("browser", "web browser"),
+    ("environments", "development environments"),
+    ("git", "git source control branches"),
+    ("connections", "remote connections"),
+    ("worktrees", "git worktrees"),
+    ("hooks", "automation hooks"),
+    ("account", "user account"),
+    ("general", "general settings"),
+    ("appearance", "appearance settings"),
+    ("voice", "voice settings"),
+    ("configuration", "configuration"),
+    ("personalization", "personalization"),
+    ("pets", "pets"),
+    ("keyboard-shortcuts", "keyboard shortcuts"),
+    ("computer-control", "computer control"),
+    ("project-folder", "collapsed project folder"),
+    ("project-open", "expanded project folder"),
+    ("section-toggle", "expand or collapse a navigation section"),
+    ("more-actions", "more actions and options menu"),
+    ("project-app", "current project or application entry"),
 ];
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_TEXT_MODEL: &str = "gpt-4.1-mini";
@@ -289,6 +316,10 @@ pub struct GenerateRequest {
     pub references: Vec<ReferenceImage>,
     #[serde(default)]
     pub resource_plans: Vec<ResourcePlan>,
+    #[serde(default)]
+    pub resource_plans_only: bool,
+    #[serde(default)]
+    pub theme: Option<ThemeManifest>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -312,6 +343,8 @@ pub struct GenerateResourceRequest {
     pub slot: String,
     pub prompt: String,
     #[serde(default)]
+    pub use_current_resource_reference: bool,
+    #[serde(default)]
     pub references: Vec<ReferenceImage>,
 }
 
@@ -320,6 +353,7 @@ pub struct GenerateResourceRequest {
 pub struct GenerateResourceResult {
     pub theme: ThemeManifest,
     pub asset: GeneratedAsset,
+    pub assets: Vec<GeneratedAsset>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -544,6 +578,7 @@ pub struct AiThemeService {
     request_log: StdMutex<Vec<AiRequestLog>>,
     generation_progress: StdMutex<GenerationProgress>,
     request_semaphore: Semaphore,
+    generation_cancelled: AtomicBool,
 }
 
 impl AiThemeService {
@@ -564,7 +599,30 @@ impl AiThemeService {
             request_log: StdMutex::new(Vec::new()),
             generation_progress: StdMutex::new(GenerationProgress::default()),
             request_semaphore: Semaphore::new(MAX_AI_REQUEST_CONCURRENCY),
+            generation_cancelled: AtomicBool::new(false),
         })
+    }
+
+    pub fn cancel_generation(&self) {
+        self.generation_cancelled.store(true, Ordering::SeqCst);
+        self.set_generation_state("cancelled", "生成已中断，已完成素材仍可继续使用或手动补充");
+    }
+
+    fn ensure_generation_active(&self) -> anyhow::Result<()> {
+        if self.generation_cancelled.load(Ordering::SeqCst) {
+            bail!("生成已由用户中断");
+        }
+        Ok(())
+    }
+
+    async fn cancellable<T>(&self, future: impl Future<Output = T>) -> anyhow::Result<T> {
+        tokio::pin!(future);
+        loop {
+            tokio::select! {
+                value = &mut future => return Ok(value),
+                _ = tokio::time::sleep(Duration::from_millis(100)) => self.ensure_generation_active()?,
+            }
+        }
     }
 
     pub fn request_log(&self) -> Vec<AiRequestLog> {
@@ -655,6 +713,61 @@ impl AiThemeService {
             item.session = session.into();
             item.path = path.into();
             item.message = message.chars().take(500).collect();
+        }
+    }
+
+    fn start_resource_generation(&self, slot: GeneratedSlot, prompt: &str, reference_count: usize) {
+        if let Ok(mut progress) = self.generation_progress.lock() {
+            progress.state = "generating".into();
+            progress.message = format!(
+                "正在生成{}；已加载 {reference_count} 张参考图",
+                slot.stage_label()
+            );
+            let item = GenerationProgressItem {
+                slot: slot.asset_slot(),
+                label: slot.stage_label(),
+                prompt: prompt.into(),
+                status: "generating".into(),
+                preview_url: String::new(),
+                session: String::new(),
+                path: String::new(),
+                message: if reference_count == 0 {
+                    "正在请求图片模型".into()
+                } else {
+                    format!("正在使用 {reference_count} 张参考图请求图片模型")
+                },
+                reference_indexes: Vec::new(),
+            };
+            if let Some(existing) = progress
+                .items
+                .iter_mut()
+                .find(|existing| existing.slot == item.slot)
+            {
+                *existing = item;
+            } else {
+                progress.items.push(item);
+            }
+        }
+    }
+
+    fn record_local_event(&self, stage: &str, outcome: &str, message: &str) {
+        let entry = AiRequestLog {
+            timestamp_ms: unix_timestamp_ms(),
+            stage: stage.into(),
+            endpoint: "local://theme-inject/resource".into(),
+            model: "本地处理".into(),
+            outcome: outcome.into(),
+            http_status: None,
+            duration_ms: 0,
+            message: message.chars().take(500).collect(),
+        };
+        crate::diagnostic::log("ai.request.finished", json!(entry));
+        if let Ok(mut entries) = self.request_log.lock() {
+            entries.push(entry);
+            if entries.len() > 64 {
+                let remove = entries.len() - 64;
+                entries.drain(..remove);
+            }
         }
     }
 
@@ -878,8 +991,16 @@ impl AiThemeService {
     }
 
     pub async fn generate(&self, mut request: GenerateRequest) -> anyhow::Result<GenerateResult> {
+        self.generation_cancelled.store(false, Ordering::SeqCst);
         self.clear_request_log();
-        self.set_generation_state("planning", "正在调用基础/视觉模型分析主题需求并生成蓝图");
+        self.set_generation_state(
+            "planning",
+            if request.resource_plans_only {
+                "正在读取当前主题并准备批量资源计划"
+            } else {
+                "正在调用基础/视觉模型分析主题需求并生成蓝图"
+            },
+        );
         let references = self.reference_data_urls(&request)?;
         if request.prompt.trim().is_empty() && !references.is_empty() {
             request.prompt =
@@ -902,6 +1023,9 @@ impl AiThemeService {
             }),
         );
         validate_resource_plans(&request.resource_plans)?;
+        if request.resource_plans_only && request.resource_plans.is_empty() {
+            bail!("仅生成资源计划时至少需要一个资源");
+        }
         let credentials = self.settings.credentials()?;
         if request.generate_images && credentials.image_api_key.is_none() {
             bail!("尚未保存生图 API Key");
@@ -938,6 +1062,10 @@ impl AiThemeService {
                 reference_assignments,
                 checkpoint.assets,
             )
+        } else if request.resource_plans_only {
+            let (theme, plans, reference_assignments) =
+                resource_plan_generation_context(&request, references.len())?;
+            (theme, plans, reference_assignments, Vec::new())
         } else {
             let blueprint = self
                 .generate_blueprint(
@@ -966,13 +1094,19 @@ impl AiThemeService {
                     })
                 })
                 .collect::<Vec<_>>();
-            let icon_plans = icon_generation_plans(&blueprint);
-            for (slot, _) in &icon_plans {
-                reference_assignments
-                    .entry(slot.asset_slot())
-                    .or_insert_with(|| default_reference_indexes(references.len()));
+            if request.resource_plans_only {
+                plans.clear();
+                reference_assignments.clear();
             }
-            plans.extend(icon_plans);
+            let icon_plans = icon_generation_plans(&blueprint);
+            if !request.resource_plans_only {
+                for (slot, _) in &icon_plans {
+                    reference_assignments
+                        .entry(slot.asset_slot())
+                        .or_insert_with(|| default_reference_indexes(references.len()));
+                }
+                plans.extend(icon_plans);
+            }
             merge_resource_plans(&mut plans, &request.resource_plans);
             for plan in &request.resource_plans {
                 if let Some(slot) = GeneratedSlot::from_asset_slot(&plan.slot) {
@@ -981,7 +1115,8 @@ impl AiThemeService {
                         .or_insert_with(|| default_reference_indexes(references.len()));
                 }
             }
-            if request.generate_sidebar_watermark
+            if !request.resource_plans_only
+                && request.generate_sidebar_watermark
                 && !plans
                     .iter()
                     .any(|(slot, _)| *slot == GeneratedSlot::SidebarWatermark)
@@ -997,7 +1132,7 @@ impl AiThemeService {
                 plans.retain(|(slot, _)| *slot != GeneratedSlot::SidebarWatermark);
                 reference_assignments.remove(&GeneratedSlot::SidebarWatermark.asset_slot());
             }
-            if request.generate_system_icons {
+            if !request.resource_plans_only && request.generate_system_icons {
                 plans.push((
                     GeneratedSlot::ActionIconAtlas,
                     action_icon_atlas_prompt(&blueprint),
@@ -1060,6 +1195,9 @@ impl AiThemeService {
             let credentials = &credentials;
             let mut results = stream::iter(pending.into_iter().map(
                 |(slot, prompt, reference_urls)| async move {
+                    if let Err(error) = self.ensure_generation_active() {
+                        return (slot, Err(error));
+                    }
                     let stage = slot.stage_label();
                     self.update_generation_item(slot, "generating", "", "", "", "");
                     let result = self
@@ -1083,6 +1221,9 @@ impl AiThemeService {
             let mut generated_bytes = self.generated_asset_bytes(&generated_assets)?;
             let mut first_error = None;
             while let Some((slot, result)) = results.next().await {
+                if self.generation_cancelled.load(Ordering::SeqCst) {
+                    break;
+                }
                 let bytes = match result {
                     Ok(bytes) => bytes,
                     Err(error) => {
@@ -1108,7 +1249,7 @@ impl AiThemeService {
                             &atlas.preview_url,
                             &atlas.session,
                             &atlas.path,
-                            "已切割为 9 个系统图标",
+                            "已切割为 30 个系统图标",
                         );
                         generated_assets.push(atlas);
                         generated_assets.extend(icons.into_iter().map(|(_, asset)| asset));
@@ -1166,7 +1307,7 @@ impl AiThemeService {
                     &generated_assets,
                 )?;
             }
-            if let Some(error) = first_error {
+            if first_error.is_some() || self.generation_cancelled.load(Ordering::SeqCst) {
                 let completed_plans = plans
                     .iter()
                     .filter(|(slot, _)| {
@@ -1176,17 +1317,25 @@ impl AiThemeService {
                     })
                     .count();
                 self.set_generation_state(
-                    "failed",
+                    if self.generation_cancelled.load(Ordering::SeqCst) {
+                        "cancelled"
+                    } else {
+                        "partial"
+                    },
                     &format!(
-                        "已完成 {completed_plans}/{} 个图片资源，可使用相同需求继续生成缺失素材",
+                        "已完成 {completed_plans}/{} 个图片资源，可在资源页手动补充缺失素材",
                         plans.len()
                     ),
                 );
-                return Err(error.context(format!(
-                    "已持久化保存 {}/{} 个图片资源；再次使用相同描述生成时将从未完成处继续",
-                    completed_plans,
-                    plans.len()
-                )));
+                theme.validate()?;
+                return Ok(GenerateResult {
+                    summary: format!(
+                        "已保留 {completed_plans}/{} 个图片资源，请手动补充缺失素材",
+                        plans.len()
+                    ),
+                    theme,
+                    assets: generated_assets,
+                });
             }
         }
         theme.validate()?;
@@ -1206,40 +1355,255 @@ impl AiThemeService {
         &self,
         mut request: GenerateResourceRequest,
     ) -> anyhow::Result<GenerateResourceResult> {
+        self.generation_cancelled.store(false, Ordering::SeqCst);
+        self.clear_request_log();
         request.theme.validate()?;
         let slot = GeneratedSlot::from_asset_slot(request.slot.trim()).context("不支持的资源槽")?;
-        if matches!(
-            slot,
-            GeneratedSlot::ActionIconAtlas
-                | GeneratedSlot::ActionIcon(_)
-                | GeneratedSlot::HomeCardIcon(_)
-        ) {
+        if matches!(slot, GeneratedSlot::HomeCardIcon(_)) {
             bail!("该资源槽不能单独生成");
         }
-        let prompt = request.prompt.trim();
-        if prompt.is_empty() || prompt.chars().count() > MAX_PROMPT_CHARS + 2_500 {
+        let user_prompt = request.prompt.trim();
+        if user_prompt.is_empty() || user_prompt.chars().count() > MAX_PROMPT_CHARS + 2_500 {
             bail!("资源提示词为空或过长");
         }
+        let prompt = resource_generation_prompt(slot, user_prompt, &request.theme);
         let credentials = self.settings.credentials()?;
         if credentials.image_api_key.is_none() {
             bail!("尚未保存生图 API Key");
         }
-        let reference_urls = self.reference_data_urls_from(request.references)?;
-        let stage = format!("重新生成{}", slot.stage_label());
-        let bytes = self
-            .generate_image(&credentials, slot, prompt, &reference_urls, &stage)
-            .await?;
-        let bytes = post_process_generated_asset(slot, &bytes)?;
-        let asset = self.stage_generated_asset(slot, &bytes)?;
-        if let Err(error) = apply_generated_slot(&mut request.theme, slot, &asset.path) {
-            self.cleanup_generated_assets(std::slice::from_ref(&asset));
-            return Err(error);
+        let mut reference_urls = if request.use_current_resource_reference {
+            self.current_resource_reference_data_urls(&request.theme, slot)?
+        } else {
+            Vec::new()
+        };
+        for reference in self.reference_data_urls_from(request.references)? {
+            if reference_urls.len() >= 6 {
+                break;
+            }
+            if !reference_urls.contains(&reference) {
+                reference_urls.push(reference);
+            }
         }
-        request.theme.validate()?;
+        self.start_resource_generation(slot, user_prompt, reference_urls.len());
+        self.record_local_event(
+            &format!("准备{}参考图", slot.stage_label()),
+            "success",
+            &format!("已准备 {} 张参考图，开始调用图片模型", reference_urls.len()),
+        );
+        let stage = format!("重新生成{}", slot.stage_label());
+        let mut bytes = match self
+            .generate_image(&credentials, slot, &prompt, &reference_urls, &stage)
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.fail_resource_generation(slot, &error);
+                return Err(error);
+            }
+        };
+        self.ensure_generation_active()?;
+        self.update_generation_item(
+            slot,
+            "generating",
+            "",
+            "",
+            "",
+            "图片已返回，正在进行绿幕抠图和尺寸优化",
+        );
+        self.record_local_event(
+            &format!("处理{}", slot.stage_label()),
+            "processing",
+            "图片已返回，正在执行绿幕抠图、主体检测和尺寸优化",
+        );
+        let (asset, assets) = if slot == GeneratedSlot::ActionIconAtlas {
+            let (atlas, icons) = match self.stage_action_icon_atlas(&bytes) {
+                Ok(processed) => processed,
+                Err(first_error) if retryable_resource_processing_error(&first_error) => {
+                    bytes = self
+                        .retry_resource_after_processing_failure(
+                            &credentials,
+                            slot,
+                            &prompt,
+                            &reference_urls,
+                            &stage,
+                            &first_error,
+                        )
+                        .await?;
+                    self.stage_action_icon_atlas(&bytes).map_err(|error| {
+                        self.fail_resource_generation_with_preview(slot, &bytes, &error);
+                        error
+                    })?
+                }
+                Err(error) => {
+                    self.fail_resource_generation_with_preview(slot, &bytes, &error);
+                    return Err(error);
+                }
+            };
+            self.ensure_generation_active()?;
+            let mut assets = Vec::with_capacity(icons.len() + 1);
+            assets.push(atlas.clone());
+            for (action_slot, icon) in icons {
+                if let Err(error) =
+                    apply_generated_slot(&mut request.theme, action_slot, &icon.path)
+                {
+                    assets.push(icon);
+                    self.cleanup_generated_assets(&assets);
+                    self.fail_resource_generation(slot, &error);
+                    return Err(error);
+                }
+                assets.push(icon);
+            }
+            (atlas, assets)
+        } else {
+            let processed = match post_process_generated_asset(slot, &bytes) {
+                Ok(processed) => processed,
+                Err(first_error) if slot.requires_transparency() => {
+                    bytes = self
+                        .retry_resource_after_processing_failure(
+                            &credentials,
+                            slot,
+                            &prompt,
+                            &reference_urls,
+                            &stage,
+                            &first_error,
+                        )
+                        .await?;
+                    post_process_generated_asset(slot, &bytes).map_err(|error| {
+                        self.fail_resource_generation(slot, &error);
+                        error
+                    })?
+                }
+                Err(error) => {
+                    self.fail_resource_generation(slot, &error);
+                    return Err(error);
+                }
+            };
+            self.ensure_generation_active()?;
+            let asset = self
+                .stage_generated_asset(slot, &processed)
+                .map_err(|error| {
+                    self.fail_resource_generation(slot, &error);
+                    error
+                })?;
+            if let Err(error) = apply_generated_slot(&mut request.theme, slot, &asset.path) {
+                self.cleanup_generated_assets(std::slice::from_ref(&asset));
+                self.fail_resource_generation(slot, &error);
+                return Err(error);
+            }
+            (asset.clone(), vec![asset])
+        };
+        request.theme.validate().map_err(|error| {
+            self.fail_resource_generation(slot, &error);
+            error
+        })?;
+        self.update_generation_item(
+            slot,
+            "completed",
+            &asset.preview_url,
+            &asset.session,
+            &asset.path,
+            if slot == GeneratedSlot::ActionIconAtlas {
+                "已切割为 30 个动作图标，等待应用"
+            } else {
+                "候选资源已生成，等待应用"
+            },
+        );
+        self.set_generation_state(
+            "completed",
+            &format!("{}候选资源已生成，等待确认", slot.stage_label()),
+        );
+        self.record_local_event(
+            &format!("保存{}", slot.stage_label()),
+            "success",
+            "绿幕抠图和主体检测通过，候选资源已写入预览区",
+        );
         Ok(GenerateResourceResult {
             theme: request.theme,
             asset,
+            assets,
         })
+    }
+
+    async fn retry_resource_after_processing_failure(
+        &self,
+        credentials: &AiCredentials,
+        slot: GeneratedSlot,
+        prompt: &str,
+        reference_urls: &[String],
+        stage: &str,
+        first_error: &anyhow::Error,
+    ) -> anyhow::Result<Vec<u8>> {
+        let first_message = format!("{first_error:#}");
+        let retry_description = if slot == GeneratedSlot::ActionIconAtlas {
+            "正在强化 6×5 网格、逐格主体和纯绿背景约束后重试一次"
+        } else {
+            "正在自动强化主体和绿幕约束后重试一次"
+        };
+        self.record_local_event(
+            &format!("处理{}", slot.stage_label()),
+            "retrying",
+            &format!("{first_message}；{retry_description}"),
+        );
+        self.update_generation_item(
+            slot,
+            "generating",
+            "",
+            "",
+            "",
+            if slot == GeneratedSlot::ActionIconAtlas {
+                "首次图集不符合 6×5 切割要求，正在强化逐格图标和绿幕约束后重试"
+            } else {
+                "首次抠图未得到有效主体，正在自动强化主体构图后重试"
+            },
+        );
+        let original_prompt = prompt.chars().take(1_500).collect::<String>();
+        let retry_prompt = resource_processing_retry_prompt(slot, &original_prompt);
+        match self
+            .generate_image(
+                credentials,
+                slot,
+                &retry_prompt,
+                reference_urls,
+                &format!("{stage}（主体检测重试）"),
+            )
+            .await
+        {
+            Ok(bytes) => Ok(bytes),
+            Err(error) => {
+                self.fail_resource_generation(slot, &error);
+                Err(error)
+            }
+        }
+    }
+
+    fn fail_resource_generation(&self, slot: GeneratedSlot, error: &anyhow::Error) {
+        let message = format!("{error:#}");
+        self.update_generation_item(slot, "failed", "", "", "", &message);
+        self.set_generation_state("failed", &message);
+        self.record_local_event(&format!("处理{}", slot.stage_label()), "error", &message);
+    }
+
+    fn fail_resource_generation_with_preview(
+        &self,
+        slot: GeneratedSlot,
+        bytes: &[u8],
+        error: &anyhow::Error,
+    ) {
+        self.fail_resource_generation(slot, error);
+        let Ok(preview_bytes) = resize_and_encode_png(bytes, 1024, 1024) else {
+            return;
+        };
+        let Ok(asset) = self.stage_generated_asset(slot, &preview_bytes) else {
+            return;
+        };
+        self.update_generation_item(
+            slot,
+            "failed",
+            &asset.preview_url,
+            &asset.session,
+            &asset.path,
+            &format!("{error:#}；已保留模型原始返回图供检查"),
+        );
     }
 
     async fn generate_blueprint(
@@ -1317,28 +1681,29 @@ impl AiThemeService {
             .as_deref()
             .context("尚未保存生图 API Key")?;
         let mut body = image_request_body(credentials, slot, prompt)?;
-        let mut rate_limit_retries = 0usize;
+        let mut attempt = 1usize;
         let mut compatibility_retry = false;
         let response = loop {
+            self.ensure_generation_active()?;
             let request_stage = if compatibility_retry {
                 format!("{stage}（兼容重试）")
-            } else if rate_limit_retries > 0 {
-                format!("{stage}（限流续跑 {}）", rate_limit_retries)
+            } else if attempt > 1 {
+                format!("{stage}（第 {attempt}/{MAX_IMAGE_ATTEMPTS} 次尝试）")
             } else {
                 stage.into()
             };
             let response = if reference_urls.is_empty() {
-                self.send_json(
+                self.cancellable(self.send_json(
                     &endpoint,
                     image_api_key,
                     &body,
                     MAX_IMAGE_RESPONSE_BYTES,
                     &request_stage,
                     &credentials.image_model,
-                )
-                .await
+                ))
+                .await?
             } else {
-                self.send_image_edit(
+                self.cancellable(self.send_image_edit(
                     &endpoint,
                     image_api_key,
                     &body,
@@ -1346,32 +1711,36 @@ impl AiThemeService {
                     MAX_IMAGE_RESPONSE_BYTES,
                     &request_stage,
                     &credentials.image_model,
-                )
-                .await
+                ))
+                .await?
             };
             match response {
                 Ok(value) => break value,
-                Err(error) if error.retry_without_json_mode && !compatibility_retry => {
+                Err(error)
+                    if error.retry_without_json_mode
+                        && !compatibility_retry
+                        && attempt < MAX_IMAGE_ATTEMPTS =>
+                {
                     body.as_object_mut().unwrap().remove("response_format");
                     compatibility_retry = true;
+                    attempt += 1;
                 }
                 Err(error)
                     if matches!(
                         error.http_status,
                         Some(StatusCode::TOO_MANY_REQUESTS | StatusCode::BAD_GATEWAY)
-                    ) && rate_limit_retries < MAX_IMAGE_RATE_LIMIT_RETRIES =>
+                    ) && attempt < MAX_IMAGE_ATTEMPTS =>
                 {
-                    rate_limit_retries += 1;
-                    let delay = image_retry_delay(error.retry_after, rate_limit_retries, stage);
+                    let delay = image_retry_delay(error.retry_after, attempt, stage);
                     let message = format!(
-                        "接口返回 {}，等待 {} 秒后仅继续此未完成资源（第 {}/{} 次重试）",
+                        "接口返回 {}，等待 {} 秒后重试此资源（下一次为第 {}/{} 次尝试）",
                         error
                             .http_status
                             .map(|status| status.as_u16())
                             .unwrap_or_default(),
                         delay.as_secs_f32(),
-                        rate_limit_retries,
-                        MAX_IMAGE_RATE_LIMIT_RETRIES
+                        attempt + 1,
+                        MAX_IMAGE_ATTEMPTS
                     );
                     self.record_request(
                         &format!("{stage}（等待续跑）"),
@@ -1382,7 +1751,8 @@ impl AiThemeService {
                         delay,
                         &message,
                     );
-                    tokio::time::sleep(delay).await;
+                    self.cancellable(tokio::time::sleep(delay)).await?;
+                    attempt += 1;
                 }
                 Err(error) => return Err(error.error),
             }
@@ -1753,6 +2123,54 @@ impl AiThemeService {
             .collect()
     }
 
+    fn current_resource_reference_data_urls(
+        &self,
+        theme: &ThemeManifest,
+        slot: GeneratedSlot,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut references = Vec::new();
+        for relative in current_resource_paths(theme, slot) {
+            if references.len() >= 6 {
+                break;
+            }
+            let Some(reference) = self.theme_asset_data_url(theme, &relative)? else {
+                continue;
+            };
+            if !references.contains(&reference) {
+                references.push(reference);
+            }
+        }
+        Ok(references)
+    }
+
+    fn theme_asset_data_url(
+        &self,
+        theme: &ThemeManifest,
+        relative: &str,
+    ) -> anyhow::Result<Option<String>> {
+        crate::theme::validate_theme_id(&theme.id)?;
+        crate::theme::validate_image_asset_path(relative)?;
+        let theme_root = self.paths.themes.join(&theme.id);
+        let candidate = theme_root.join(relative);
+        if !theme_root.is_dir() || !candidate.is_file() {
+            return Ok(None);
+        }
+        let root = theme_root.canonicalize()?;
+        let path = candidate.canonicalize()?;
+        if !path.starts_with(&root) || !path.is_file() {
+            bail!("当前资源路径无效");
+        }
+        let bytes = fs::read(&path)?;
+        if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
+            bail!("当前资源为空或超过 15 MB");
+        }
+        let mime = image_mime(&path)?;
+        Ok(Some(format!(
+            "data:{mime};base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        )))
+    }
+
     fn stage_generated_asset(
         &self,
         slot: GeneratedSlot,
@@ -1789,14 +2207,15 @@ impl AiThemeService {
             let image = image::load_from_memory(bytes)
                 .context("无法解码系统图标图集")?
                 .to_rgba8();
-            let cell_width = image.width() / 3;
-            let cell_height = image.height() / 3;
+            let cell_width = image.width() / ICON_ATLAS_COLUMNS;
+            let cell_height = image.height() / ICON_ATLAS_ROWS;
             if cell_width < 128 || cell_height < 128 {
                 bail!("系统图标图集尺寸过小");
             }
             for (index, &(action, _)) in ICON_ACTIONS.iter().enumerate() {
-                let column = u32::try_from(index % 3).unwrap_or_default();
-                let row = u32::try_from(index / 3).unwrap_or_default();
+                let index = u32::try_from(index).unwrap_or_default();
+                let column = index % ICON_ATLAS_COLUMNS;
+                let row = index / ICON_ATLAS_COLUMNS;
                 let cell = image::imageops::crop_imm(
                     &image,
                     column * cell_width,
@@ -1805,7 +2224,9 @@ impl AiThemeService {
                     cell_height,
                 )
                 .to_image();
-                let bytes = encode_png(&normalize_transparent_asset(cell, 512, 512)?)?;
+                let normalized = normalize_transparent_asset_with_min_subject(cell, 512, 512, 8)
+                    .with_context(|| format!("图集第 {} 格（{action}）处理失败", index + 1))?;
+                let bytes = encode_png(&normalized)?;
                 let slot = GeneratedSlot::ActionIcon(action);
                 icons.push((slot, self.stage_generated_asset(slot, &bytes)?));
             }
@@ -1900,11 +2321,11 @@ impl GeneratedSlot {
             Self::BackgroundSidebar | Self::SidebarWatermark => "1:2".into(),
             Self::Logo | Self::HeroImage => "2:1".into(),
             Self::ComposerDecoration => "3:1".into(),
+            Self::ActionIconAtlas => format!("{ICON_ATLAS_COLUMNS}:{ICON_ATLAS_ROWS}"),
             Self::HeroBadge
             | Self::Avatar
             | Self::Sticker
             | Self::Decoration(_)
-            | Self::ActionIconAtlas
             | Self::ActionIcon(_)
             | Self::HomeCardIcon(_) => "1:1".into(),
         };
@@ -1916,7 +2337,7 @@ impl GeneratedSlot {
             Self::Logo => "1536x768".into(),
             Self::HeroImage => "1536x768".into(),
             Self::ComposerDecoration => "1536x512".into(),
-            Self::ActionIconAtlas => "1536x1536".into(),
+            Self::ActionIconAtlas => "1536x1280".into(),
             Self::HeroBadge | Self::Avatar | Self::ActionIcon(_) | Self::HomeCardIcon(_) => {
                 "1024x1024".into()
             }
@@ -2014,9 +2435,9 @@ impl GeneratedSlot {
         match self {
             Self::BackgroundFullscreen => "全屏背景".into(),
             Self::BackgroundContent => "内容区背景".into(),
-            Self::BackgroundSidebar => "侧栏背景".into(),
+            Self::BackgroundSidebar => "左侧导航背景".into(),
             Self::Logo => "Logo".into(),
-            Self::SidebarWatermark => "侧栏水印".into(),
+            Self::SidebarWatermark => "左侧导航水印".into(),
             Self::HeroImage => "Hero 图片".into(),
             Self::HeroBadge => "Hero 徽章".into(),
             Self::Avatar => "头像".into(),
@@ -2072,6 +2493,21 @@ fn post_process_generated_asset(slot: GeneratedSlot, bytes: &[u8]) -> anyhow::Re
     encode_png(&normalize_transparent_asset(image, width, height)?)
 }
 
+fn retryable_resource_processing_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}");
+    [
+        "绿幕",
+        "纯绿背景",
+        "有效主体",
+        "检测到主体",
+        "图标图集尺寸过小",
+        "无法解码系统图标图集",
+        "无法解码待优化的生成资源",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
 fn resize_within(image: DynamicImage, max_width: u32, max_height: u32) -> DynamicImage {
     if image.width() <= max_width && image.height() <= max_height {
         image
@@ -2101,9 +2537,18 @@ fn encode_jpeg(image: &DynamicImage, quality: u8) -> anyhow::Result<Vec<u8>> {
 }
 
 fn normalize_transparent_asset(
+    image: RgbaImage,
+    target_width: u32,
+    target_height: u32,
+) -> anyhow::Result<RgbaImage> {
+    normalize_transparent_asset_with_min_subject(image, target_width, target_height, 100)
+}
+
+fn normalize_transparent_asset_with_min_subject(
     mut image: RgbaImage,
     target_width: u32,
     target_height: u32,
+    minimum_subject_basis_points: usize,
 ) -> anyhow::Result<RgbaImage> {
     let pixel_count = image.width() as usize * image.height() as usize;
     let mut strengths = vec![0_u8; pixel_count];
@@ -2180,7 +2625,7 @@ fn normalize_transparent_asset(
     if transparent * 20 < total {
         bail!("绿幕抠图后没有生成有效透明背景，请重试此资源");
     }
-    if opaque == 0 || opaque * 100 < total {
+    if opaque == 0 || opaque * 10_000 < total * minimum_subject_basis_points {
         bail!("绿幕抠图后没有检测到有效主体");
     }
     let bounds = alpha_bounds(&image).context("绿幕抠图后没有检测到主体")?;
@@ -2273,8 +2718,8 @@ fn action_icon_atlas_prompt(blueprint: &ThemeBlueprint) -> String {
         .collect::<Vec<_>>()
         .join("; ");
     format!(
-        "Create a precise 3 by 3 sprite atlas for a cohesive desktop IDE action icon set. \
-         Use exactly nine equal cells in row-major order: {meanings}. Theme: {}. Style: {}. \
+        "Create a precise 6 column by 5 row sprite atlas for a cohesive desktop IDE action icon set. \
+         Use exactly thirty equal cells in row-major order: {meanings}. Theme: {}. Style: {}. \
          Every cell contains one centered icon with identical scale, stroke weight and generous padding. \
          The entire canvas and every gap must be solid pure chroma green #00FF00. \
          Render the icon subjects in a bright high-contrast color derived from the theme foreground/accent; never use black or near-black subjects and never draw circular or square button plates. No text, labels, dividers, frames, shadows, gradients, checkerboard or extra objects.",
@@ -2285,6 +2730,38 @@ fn action_icon_atlas_prompt(blueprint: &ThemeBlueprint) -> String {
             blueprint.icon_style.trim()
         }
     )
+}
+
+fn resource_generation_prompt(
+    slot: GeneratedSlot,
+    user_prompt: &str,
+    theme: &ThemeManifest,
+) -> String {
+    if slot != GeneratedSlot::ActionIconAtlas {
+        return user_prompt.to_string();
+    }
+    let meanings = ICON_ACTIONS
+        .iter()
+        .enumerate()
+        .map(|(index, (action, meaning))| format!("cell {}: {action} ({meaning})", index + 1))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "User style direction: {user_prompt}. Create one exact 6 column by 5 row sprite atlas with thirty equal cells in this fixed row-major order: {meanings}. Theme colors: foreground {}, accent {}, sidebar background {}. Every cell must contain exactly one centered, clearly visible action icon occupying 35% to 60% of that cell, with consistent scale, stroke weight and padding. Fill the complete canvas, including every cell background and gap, with uniform pure chroma green #00FF00. Do not draw text, labels, grid lines, dividers, frames, button plates, shadows, gradients, checkerboards or empty cells.",
+        theme.tokens.foreground, theme.tokens.accent, theme.tokens.sidebar_background
+    )
+}
+
+fn resource_processing_retry_prompt(slot: GeneratedSlot, original_prompt: &str) -> String {
+    if slot == GeneratedSlot::ActionIconAtlas {
+        format!(
+            "{original_prompt}. RETRY REQUIREMENT: preserve the exact 6 column by 5 row atlas and fixed row-major order. Draw all thirty icons, one centered icon in every cell, each occupying 40% to 65% of its cell. Every cell and every gap must touch the same flat pure #00FF00 background. No missing or tiny icons, no merged cells, no single large subject, no text, grid lines, dividers, frames or button plates."
+        )
+    } else {
+        format!(
+            "{original_prompt}. RETRY REQUIREMENT: draw exactly one large, clearly visible subject centered in the canvas, occupying 45% to 70% of the image area. Keep a wide uninterrupted pure #00FF00 border around it. No tiny subject, no green subject, no scattered objects, no empty canvas."
+        )
+    }
 }
 
 fn sidebar_watermark_prompt(blueprint: &ThemeBlueprint) -> String {
@@ -2342,6 +2819,13 @@ fn generation_fingerprint(
         hash.update(reference.as_bytes());
         hash.update([0]);
     }
+    hash.update([u8::from(request.resource_plans_only)]);
+    if request.resource_plans_only
+        && let Some(theme) = &request.theme
+    {
+        hash.update(serde_json::to_vec(theme).unwrap_or_default());
+        hash.update([0]);
+    }
     for plan in &request.resource_plans {
         hash.update(plan.slot.as_bytes());
         hash.update([0]);
@@ -2349,6 +2833,40 @@ fn generation_fingerprint(
         hash.update([0]);
     }
     format!("{:x}", hash.finalize())
+}
+
+fn resource_plan_generation_context(
+    request: &GenerateRequest,
+    reference_count: usize,
+) -> anyhow::Result<(
+    ThemeManifest,
+    Vec<(GeneratedSlot, String)>,
+    BTreeMap<String, Vec<usize>>,
+)> {
+    let theme = request
+        .theme
+        .clone()
+        .context("仅生成资源计划时缺少当前主题")?;
+    theme.validate()?;
+    let plans = request
+        .resource_plans
+        .iter()
+        .map(|plan| {
+            GeneratedSlot::from_asset_slot(&plan.slot)
+                .map(|slot| (slot, plan.prompt.clone()))
+                .context("批量资源计划包含不支持的资源槽")
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let reference_assignments = plans
+        .iter()
+        .map(|(slot, _)| {
+            (
+                slot.asset_slot(),
+                default_reference_indexes(reference_count),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    Ok((theme, plans, reference_assignments))
 }
 
 fn validate_requested_metadata(request: &GenerateRequest) -> anyhow::Result<()> {
@@ -2544,6 +3062,39 @@ fn theme_from_blueprint(blueprint: &ThemeBlueprint) -> anyhow::Result<ThemeManif
         &theme.tokens.active_background,
         4.5,
     )?);
+    theme.chrome.right_sidebar_background = Some(theme.tokens.input_background.clone());
+    theme.chrome.right_sidebar_foreground = Some(accessible_foreground_for_surface(
+        &theme.tokens.foreground,
+        &theme.tokens.input_background,
+        4.5,
+    )?);
+    theme.chrome.right_sidebar_muted_foreground = Some(accessible_foreground_for_surface(
+        &theme.tokens.muted_foreground,
+        &theme.tokens.input_background,
+        3.0,
+    )?);
+    theme.chrome.right_sidebar_icon = theme.chrome.right_sidebar_foreground.clone();
+    theme.chrome.right_sidebar_border = Some(border_for_surface(
+        &theme.tokens.border,
+        &theme.tokens.input_background,
+        &theme.tokens.foreground,
+    )?);
+    theme.chrome.right_sidebar_hover = Some(safe_hover_color(
+        &theme.tokens.input_background,
+        &theme.tokens.foreground,
+    )?);
+    theme.chrome.right_sidebar_active = Some(theme.tokens.active_background.clone());
+    theme.chrome.right_sidebar_active_foreground = Some(accessible_foreground_for_surface(
+        &theme.tokens.foreground,
+        &theme.tokens.active_background,
+        4.5,
+    )?);
+    theme.chrome.right_sidebar_shortcut_background = Some(theme.tokens.elevated_background.clone());
+    theme.chrome.right_sidebar_shortcut_foreground = Some(accessible_foreground_for_surface(
+        &theme.tokens.muted_foreground,
+        &theme.tokens.elevated_background,
+        3.0,
+    )?);
     theme.layout.density = blueprint.style.density.clamp(0.75, 1.35);
     theme.layout.sidebar_width = blueprint
         .style
@@ -2692,6 +3243,72 @@ fn apply_generated_slot(
         }
     }
     theme.validate()
+}
+
+fn current_resource_paths(theme: &ThemeManifest, slot: GeneratedSlot) -> Vec<String> {
+    let background_path = |background: &RegionBackground| match &background.source {
+        BackgroundSource::Image { path, .. } => Some(path.clone()),
+        _ => None,
+    };
+    let resource = |value: &Option<String>| value.iter().cloned().collect::<Vec<_>>();
+    match slot {
+        GeneratedSlot::BackgroundFullscreen => background_path(&theme.background.fullscreen)
+            .into_iter()
+            .collect(),
+        GeneratedSlot::BackgroundContent => background_path(&theme.background.content)
+            .into_iter()
+            .collect(),
+        GeneratedSlot::BackgroundSidebar => background_path(&theme.background.sidebar)
+            .into_iter()
+            .collect(),
+        GeneratedSlot::Logo => resource(&theme.skin.resources.logo),
+        GeneratedSlot::SidebarWatermark => resource(&theme.skin.resources.sidebar_watermark),
+        GeneratedSlot::HeroImage => resource(&theme.skin.resources.hero_image),
+        GeneratedSlot::HeroBadge => resource(&theme.skin.resources.hero_badge),
+        GeneratedSlot::Avatar => resource(&theme.skin.resources.avatar),
+        GeneratedSlot::Sticker => resource(&theme.skin.resources.sticker),
+        GeneratedSlot::ComposerDecoration => resource(&theme.skin.resources.composer_decoration),
+        GeneratedSlot::Decoration(index) => theme
+            .skin
+            .decorations
+            .get(index)
+            .map(|decoration| decoration.asset.clone())
+            .filter(|path| !path.is_empty())
+            .into_iter()
+            .collect(),
+        GeneratedSlot::ActionIconAtlas => ICON_ACTIONS
+            .iter()
+            .filter_map(|(action, _)| theme.skin.icons.mappings.get(*action).cloned())
+            .collect(),
+        GeneratedSlot::ActionIcon(action) => {
+            let mut paths = Vec::new();
+            if let Some(path) = theme.skin.icons.mappings.get(action) {
+                paths.push(path.clone());
+            }
+            for (candidate, _) in ICON_ACTIONS {
+                if paths.len() >= 6 {
+                    break;
+                }
+                if candidate == action {
+                    continue;
+                }
+                if let Some(path) = theme.skin.icons.mappings.get(candidate)
+                    && !paths.contains(path)
+                {
+                    paths.push(path.clone());
+                }
+            }
+            paths
+        }
+        GeneratedSlot::HomeCardIcon(index) => theme
+            .skin
+            .home
+            .cards
+            .get(index)
+            .and_then(|card| card.icon.clone())
+            .into_iter()
+            .collect(),
+    }
 }
 
 fn validate_blueprint(blueprint: &ThemeBlueprint) -> anyhow::Result<()> {
@@ -3690,6 +4307,8 @@ mod tests {
             reference_path: None,
             references: Vec::new(),
             resource_plans: Vec::new(),
+            resource_plans_only: false,
+            theme: None,
         }
     }
 
@@ -3835,6 +4454,33 @@ mod tests {
         assert_eq!(
             theme.chrome.sidebar_muted_foreground.as_deref(),
             Some(theme.tokens.muted_foreground.as_str())
+        );
+        assert_contrast(
+            theme.chrome.right_sidebar_foreground.as_deref().unwrap(),
+            theme.chrome.right_sidebar_background.as_deref().unwrap(),
+            4.5,
+        );
+        assert_contrast(
+            theme
+                .chrome
+                .right_sidebar_muted_foreground
+                .as_deref()
+                .unwrap(),
+            theme.chrome.right_sidebar_background.as_deref().unwrap(),
+            3.0,
+        );
+        assert_contrast(
+            theme
+                .chrome
+                .right_sidebar_shortcut_foreground
+                .as_deref()
+                .unwrap(),
+            theme
+                .chrome
+                .right_sidebar_shortcut_background
+                .as_deref()
+                .unwrap(),
+            3.0,
         );
         assert_contrast(
             theme.chrome.titlebar_foreground.as_deref().unwrap(),
@@ -4025,6 +4671,133 @@ mod tests {
         assert_eq!(mime, "image/png");
         assert_eq!(bytes, vec![1, 2, 3]);
         assert!(decode_reference_data_url("data:text/plain;base64,QQ==").is_err());
+    }
+
+    #[test]
+    fn current_resource_references_follow_theme_icon_mappings() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_root(temp.path().join("ThemeInject"));
+        paths.ensure().unwrap();
+        let service =
+            AiThemeService::new(paths.clone(), "http://127.0.0.1:1".into(), "token".into())
+                .unwrap();
+        let mut theme = ThemeManifest::neutral_dark();
+        theme.id = "local.current-reference".into();
+        theme.skin.icons.mode = IconMode::Custom;
+        theme
+            .skin
+            .icons
+            .mappings
+            .insert("sidebar-toggle".into(), "assets/sidebar-toggle.png".into());
+        theme
+            .skin
+            .icons
+            .mappings
+            .insert("search".into(), "assets/search.png".into());
+        let assets = paths.themes.join(&theme.id).join("assets");
+        fs::create_dir_all(&assets).unwrap();
+        let toggle_image = encode_png(&RgbaImage::from_pixel(
+            32,
+            32,
+            image::Rgba([32, 96, 224, 255]),
+        ))
+        .unwrap();
+        let search_image = encode_png(&RgbaImage::from_pixel(
+            32,
+            32,
+            image::Rgba([224, 96, 32, 255]),
+        ))
+        .unwrap();
+        fs::write(assets.join("sidebar-toggle.png"), &toggle_image).unwrap();
+        fs::write(assets.join("search.png"), &search_image).unwrap();
+
+        assert_eq!(
+            current_resource_paths(&theme, GeneratedSlot::ActionIcon("search")),
+            vec!["assets/search.png", "assets/sidebar-toggle.png"]
+        );
+        assert_eq!(
+            current_resource_paths(&theme, GeneratedSlot::ActionIcon("plugins")),
+            vec!["assets/sidebar-toggle.png", "assets/search.png"]
+        );
+        let references = service
+            .current_resource_reference_data_urls(&theme, GeneratedSlot::ActionIconAtlas)
+            .unwrap();
+        assert_eq!(references.len(), 2);
+        assert!(
+            references
+                .iter()
+                .all(|reference| reference.starts_with("data:image/png;base64,"))
+        );
+    }
+
+    #[test]
+    fn current_resource_reference_flag_is_backward_compatible() {
+        let request: GenerateResourceRequest = serde_json::from_value(json!({
+            "theme": ThemeManifest::neutral_dark(),
+            "slot": "skin.icons.search",
+            "prompt": "regenerate search icon",
+            "references": []
+        }))
+        .unwrap();
+        assert!(!request.use_current_resource_reference);
+        assert_eq!(
+            GeneratedSlot::from_asset_slot(&request.slot),
+            Some(GeneratedSlot::ActionIcon("search"))
+        );
+    }
+
+    #[test]
+    fn resource_processing_retry_only_covers_generated_image_failures() {
+        assert!(retryable_resource_processing_error(&anyhow::anyhow!(
+            "绿幕抠图后没有检测到有效主体"
+        )));
+        assert!(retryable_resource_processing_error(&anyhow::anyhow!(
+            "系统图标图集尺寸过小"
+        )));
+        assert!(!retryable_resource_processing_error(&anyhow::anyhow!(
+            "无法写入暂存目录"
+        )));
+    }
+
+    #[test]
+    fn single_resource_progress_and_local_errors_remain_visible() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_root(temp.path().join("ThemeInject"));
+        paths.ensure().unwrap();
+        let service =
+            AiThemeService::new(paths, "http://127.0.0.1:1".into(), "token".into()).unwrap();
+        service
+            .generation_progress
+            .lock()
+            .unwrap()
+            .items
+            .push(GenerationProgressItem {
+                slot: "skin.logo".into(),
+                label: "Logo".into(),
+                prompt: "existing".into(),
+                status: "completed".into(),
+                preview_url: String::new(),
+                session: String::new(),
+                path: String::new(),
+                message: String::new(),
+                reference_indexes: Vec::new(),
+            });
+
+        let slot = GeneratedSlot::ActionIcon("plugins");
+        service.start_resource_generation(slot, "missing icon", 4);
+        let progress = service.generation_progress();
+        assert_eq!(progress.state, "generating");
+        assert_eq!(progress.items.len(), 2);
+        assert_eq!(progress.items[1].slot, "skin.icons.plugins");
+        assert!(progress.items[1].message.contains("4 张参考图"));
+
+        service.fail_resource_generation(slot, &anyhow::anyhow!("绿幕抠图失败"));
+        let progress = service.generation_progress();
+        assert_eq!(progress.state, "failed");
+        assert_eq!(progress.items[1].status, "failed");
+        let logs = service.request_log();
+        assert_eq!(logs.last().unwrap().outcome, "error");
+        assert!(logs.last().unwrap().message.contains("绿幕抠图失败"));
     }
 
     #[test]
@@ -4264,6 +5037,12 @@ mod tests {
                 .unwrap(),
             ("1024x1024".into(), "1:1".into())
         );
+        assert_eq!(
+            GeneratedSlot::ActionIconAtlas
+                .image_spec("16:9", "gpt-image-2")
+                .unwrap(),
+            ("1536x1280".into(), "6:5".into())
+        );
 
         let credentials = AiCredentials {
             base_url: "https://api.example.com/v1".into(),
@@ -4312,7 +5091,7 @@ mod tests {
                 GeneratedSlot::ActionIconAtlas
                     .image_spec("16:9", model)
                     .unwrap(),
-                ("1024x1024".into(), "1:1".into())
+                ("1536x1024".into(), "6:5".into())
             );
         }
 
@@ -4419,7 +5198,7 @@ mod tests {
     fn system_icon_atlas_uses_fixed_grid_order() {
         let blueprint = blueprint();
         let prompt = action_icon_atlas_prompt(&blueprint);
-        assert!(prompt.contains("3 by 3"));
+        assert!(prompt.contains("6 column by 5 row"));
         for (_, meaning) in ICON_ACTIONS {
             assert!(prompt.contains(meaning));
         }
@@ -4427,18 +5206,55 @@ mod tests {
     }
 
     #[test]
-    fn system_icon_atlas_is_split_into_nine_transparent_assets() {
+    fn resource_icon_atlas_prompt_always_restores_grid_constraints() {
+        let theme = ThemeManifest::neutral_dark();
+        let prompt = resource_generation_prompt(
+            GeneratedSlot::ActionIconAtlas,
+            "match the supplied style",
+            &theme,
+        );
+        assert!(prompt.contains("exact 6 column by 5 row sprite atlas"));
+        assert!(prompt.contains("cell 30: project-app"));
+        assert!(prompt.contains("#00FF00"));
+        assert!(prompt.contains("match the supplied style"));
+    }
+
+    #[test]
+    fn icon_atlas_retry_keeps_thirty_cells() {
+        let prompt = resource_processing_retry_prompt(
+            GeneratedSlot::ActionIconAtlas,
+            "original atlas prompt",
+        );
+        assert!(prompt.contains("all thirty icons"));
+        assert!(prompt.contains("one centered icon in every cell"));
+        assert!(prompt.contains("no single large subject"));
+        assert!(!prompt.contains("draw exactly one large"));
+    }
+
+    #[test]
+    fn thin_icon_cell_passes_atlas_subject_threshold() {
+        let mut cell = RgbaImage::from_pixel(256, 256, image::Rgba([0, 255, 0, 255]));
+        for x in 96..160 {
+            cell.put_pixel(x, 128, image::Rgba([245, 245, 245, 255]));
+        }
+        let output = normalize_transparent_asset_with_min_subject(cell, 512, 512, 8).unwrap();
+        assert!(output.pixels().any(|pixel| pixel.0[3] == 255));
+        assert!(output.pixels().any(|pixel| pixel.0[3] == 0));
+    }
+
+    #[test]
+    fn system_icon_atlas_is_split_into_thirty_transparent_assets() {
         let temp = tempfile::tempdir().unwrap();
         let paths = AppPaths::from_root(temp.path().join("ThemeInject"));
         paths.ensure().unwrap();
         let service =
             AiThemeService::new(paths.clone(), "http://127.0.0.1:1".into(), "token".into())
                 .unwrap();
-        let mut atlas = RgbaImage::from_pixel(768, 768, image::Rgba([0, 255, 0, 255]));
-        for index in 0..9_u32 {
-            let left = index % 3 * 256 + 72;
-            let top = index / 3 * 256 + 72;
-            let color = image::Rgba([80 + index as u8 * 12, 24, 180, 255]);
+        let mut atlas = RgbaImage::from_pixel(1536, 1280, image::Rgba([0, 255, 0, 255]));
+        for index in 0..ICON_ACTIONS.len() as u32 {
+            let left = index % ICON_ATLAS_COLUMNS * 256 + 72;
+            let top = index / ICON_ATLAS_COLUMNS * 256 + 72;
+            let color = image::Rgba([80 + (index % 14) as u8 * 12, 24 + index as u8, 180, 255]);
             for y in top..top + 112 {
                 for x in left..left + 112 {
                     atlas.put_pixel(x, y, color);
@@ -4473,7 +5289,7 @@ mod tests {
         let service =
             AiThemeService::new(paths.clone(), "http://127.0.0.1:1".into(), "token".into())
                 .unwrap();
-        let mut atlas = RgbaImage::from_pixel(768, 768, image::Rgba([245, 245, 245, 255]));
+        let mut atlas = RgbaImage::from_pixel(1280, 1280, image::Rgba([245, 245, 245, 255]));
         for y in 0..256 {
             for x in 0..256 {
                 atlas.put_pixel(x, y, image::Rgba([0, 255, 0, 255]));
@@ -4509,6 +5325,25 @@ mod tests {
             prompt: "invalid reserved slot".into(),
         }];
         assert!(validate_resource_plans(&invalid).is_err());
+    }
+
+    #[test]
+    fn resource_plan_only_generation_preserves_current_theme() {
+        let current = ThemeManifest::neutral_dark();
+        let mut request = test_generate_request("只生成装饰资源");
+        request.resource_plans_only = true;
+        request.theme = Some(current.clone());
+        request.resource_plans = vec![ResourcePlan {
+            slot: "skin.decorations.0.asset".into(),
+            prompt: "transparent corner ornament".into(),
+        }];
+
+        let (theme, plans, references) = resource_plan_generation_context(&request, 2).unwrap();
+
+        assert_eq!(theme, current);
+        assert_eq!(plans.len(), 1);
+        assert!(matches!(plans[0].0, GeneratedSlot::Decoration(0)));
+        assert_eq!(references["skin.decorations.0.asset"], vec![1, 2]);
     }
 
     #[test]
@@ -4832,6 +5667,8 @@ mod tests {
                 reference_path: None,
                 references: Vec::new(),
                 resource_plans: Vec::new(),
+                resource_plans_only: false,
+                theme: None,
             })
             .await
             .unwrap();

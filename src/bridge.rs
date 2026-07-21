@@ -360,7 +360,7 @@ fn request_timeout(method: &str) -> Duration {
 }
 
 fn uses_general_capacity(method: &str) -> bool {
-    method != "theme.preview.cancel"
+    !matches!(method, "theme.preview.cancel" | "ai.generation.cancel")
 }
 
 fn failed(code: &str, message: &str) -> RpcResponse {
@@ -378,10 +378,12 @@ fn valid_method(method: &str) -> bool {
     matches!(
         method,
         "theme.health"
+            | "theme.window.chrome"
             | "ai.settings.get"
             | "ai.settings.save"
             | "ai.log.get"
             | "ai.progress.get"
+            | "ai.generation.cancel"
             | "ai.generation.restore"
             | "ai.generation.save"
             | "ai.reference.import"
@@ -427,12 +429,14 @@ mod tests {
     #[test]
     fn method_allowlist_is_closed() {
         assert!(valid_method("theme.apply"));
+        assert!(valid_method("theme.window.chrome"));
         assert!(valid_method("ai.generate"));
         assert!(valid_method("ai.resource.generate"));
         assert!(valid_method("app.trigger.save"));
         assert!(valid_method("app.trigger.icon.import"));
         assert!(valid_method("theme.package.metadata"));
         assert!(valid_method("ai.progress.get"));
+        assert!(valid_method("ai.generation.cancel"));
         assert!(valid_method("ai.generation.restore"));
         assert!(valid_method("ai.generation.save"));
         assert!(valid_method("ai.reference.upload"));
@@ -484,13 +488,14 @@ mod tests {
     }
 
     #[test]
-    fn preview_cleanup_does_not_consume_general_capacity() {
+    fn cleanup_and_generation_cancel_do_not_consume_general_capacity() {
         let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS));
         let held = (0..MAX_CONCURRENT_REQUESTS)
             .map(|_| permits.clone().try_acquire_owned().unwrap())
             .collect::<Vec<_>>();
         assert!(permits.clone().try_acquire_owned().is_err());
         assert!(!uses_general_capacity("theme.preview.cancel"));
+        assert!(!uses_general_capacity("ai.generation.cancel"));
         assert!(uses_general_capacity("theme.background.data"));
         drop(held);
     }
