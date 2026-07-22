@@ -523,6 +523,16 @@ impl ThemeService {
             }
             "ai.generation.save" => self.save_generated_theme(params),
             "theme.state.get" => self.state_value(),
+            "app.language.save" => {
+                let language = string_param(&params, "language")?;
+                if !matches!(language, "system" | "zh-CN" | "en-US") {
+                    bail!("界面语言设置无效");
+                }
+                let mut settings = self.settings.load()?;
+                settings.ui_language = language.to_string();
+                self.settings.save(&settings)?;
+                self.state_value()
+            }
             "app.trigger.save" => {
                 let appearance: TriggerAppearance = serde_json::from_value(
                     params
@@ -980,12 +990,26 @@ fn schedule_dev_relaunch(
 }
 
 fn runtime_script() -> anyhow::Result<String> {
-    let script = include_str!("../assets/theme-runtime.js");
+    let script = [
+        include_str!("../assets/theme-runtime.js"),
+        include_str!("../assets/runtime/i18n.js"),
+        include_str!("../assets/runtime/theme-renderer.js"),
+        include_str!("../assets/runtime/panel-ui.js"),
+        include_str!("../assets/runtime/ai-generation.js"),
+        include_str!("../assets/runtime/ambient-effects.js"),
+        include_str!("../assets/runtime/studio.js"),
+        include_str!("../assets/runtime/lifecycle.js"),
+    ]
+    .join("\n");
     let css = include_str!("../assets/theme-panel.css");
     let icon = format!(
         "data:image/png;base64,{}",
         base64::engine::general_purpose::STANDARD.encode(include_bytes!("../assets/icon.png"))
     );
+    let locales = json!({
+        "zh-CN": serde_json::from_str::<Value>(include_str!("../assets/locales/zh-CN.json"))?,
+        "en-US": serde_json::from_str::<Value>(include_str!("../assets/locales/en-US.json"))?,
+    });
     Ok(script
         .replace(
             "__THEME_INJECT_PANEL_CSS_JSON__",
@@ -994,5 +1018,37 @@ fn runtime_script() -> anyhow::Result<String> {
         .replace(
             "__THEME_INJECT_ICON_DATA_URL_JSON__",
             &serde_json::to_string(&icon)?,
+        )
+        .replace(
+            "__THEME_INJECT_LOCALES_JSON__",
+            &serde_json::to_string(&locales)?,
         ))
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+
+    #[test]
+    fn assembles_runtime_modules_in_dependency_order() {
+        let script = runtime_script().unwrap();
+        let i18n = script.find("Runtime module: i18n").unwrap();
+        let renderer = script.find("Runtime module: theme-renderer").unwrap();
+        let panel = script.find("Runtime module: panel-ui").unwrap();
+        let generation = script.find("Runtime module: ai-generation").unwrap();
+        let effects = script.find("Runtime module: ambient-effects").unwrap();
+        let studio = script.find("Runtime module: studio").unwrap();
+        let lifecycle = script.find("Runtime module: lifecycle").unwrap();
+
+        assert!(i18n < renderer);
+        assert!(renderer < panel);
+        assert!(panel < generation);
+        assert!(generation < effects);
+        assert!(effects < studio);
+        assert!(studio < lifecycle);
+        assert!(!script.contains("__THEME_INJECT_PANEL_CSS_JSON__"));
+        assert!(!script.contains("__THEME_INJECT_ICON_DATA_URL_JSON__"));
+        assert!(!script.contains("__THEME_INJECT_LOCALES_JSON__"));
+        assert!(script.trim_end().ends_with("})();"));
+    }
 }

@@ -1,5 +1,7 @@
 # Theme Inject
 
+[English](README.en.md) | 简体中文
+
 一个给 Windows 版 Codex 注入自定义主题的独立启动器。
 
 Theme Inject 会通过 Chromium DevTools Protocol（CDP）把主题运行时注入到 Codex renderer 中，并在 Codex 内提供主题面板、主题库、背景配置、高级皮肤和 AI 主题工作台。它的目标很简单：让 Codex 不只好用，也能长成你喜欢的样子。
@@ -22,6 +24,7 @@ Theme Inject 会通过 Chromium DevTools Protocol（CDP）把主题运行时注�
 - 支持高级皮肤：Logo、侧栏水印、Hero 图、头像、动作图标、首页卡片图标、装饰层和组件表面等。
 - 支持兼容 OpenAI 协议的 AI 主题生成，可从文字或参考图生成主题草稿和图片资源；没有参考图时也会自动生成默认资源。
 - 支持主题包检查点、失败资源续跑、实时请求日志和资源级别的重新生成。
+- 主题面板会检测系统语言，使用 JSON 语言包自动显示简体中文或英文界面。
 
 ## 新增与改进
 
@@ -129,6 +132,8 @@ target\release\theme-inject.exe
 powershell -ExecutionPolicy Bypass -File .\scripts\restart-dev.ps1
 ```
 
+注入运行时按职责拆分在 `assets/runtime/` 中，由 Rust 在编译时按顺序拼装为同一个闭包。界面语言包位于 `assets/locales/`。
+
 推送到 `clean-version` 分支时，GitHub Actions 会自动运行测试、构建 Windows Release，并上传包含程序、README 和示例主题包的 ZIP 构件。
 
 ## 有没有风险
@@ -173,7 +178,7 @@ assets/
 cargo fmt --all -- --check
 cargo test
 cargo clippy --all-targets -- -D warnings
-node --check assets/theme-runtime.js
+node scripts/check-runtime.mjs
 ```
 
 ## 更多文档

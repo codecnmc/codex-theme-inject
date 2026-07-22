@@ -57,8 +57,14 @@ pub struct AppSettings {
     pub active_theme_id: String,
     #[serde(default)]
     pub last_codex_version: String,
+    #[serde(default = "default_ui_language")]
+    pub ui_language: String,
     #[serde(default)]
     pub trigger_appearance: TriggerAppearance,
+}
+
+fn default_ui_language() -> String {
+    "system".into()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -133,6 +139,7 @@ impl Default for AppSettings {
         Self {
             active_theme_id: "builtin.neutral-dark".to_string(),
             last_codex_version: String::new(),
+            ui_language: default_ui_language(),
             trigger_appearance: TriggerAppearance::default(),
         }
     }
@@ -158,6 +165,9 @@ impl SettingsStore {
 
     pub fn save(&self, settings: &AppSettings) -> anyhow::Result<()> {
         settings.trigger_appearance.validate()?;
+        if !matches!(settings.ui_language.as_str(), "system" | "zh-CN" | "en-US") {
+            bail!("界面语言设置无效");
+        }
         atomic_write(&self.path, &serde_json::to_vec_pretty(settings)?)
     }
 }
@@ -374,6 +384,23 @@ mod tests {
             settings.load().unwrap().trigger_appearance,
             TriggerAppearance::default()
         );
+        assert_eq!(settings.load().unwrap().ui_language, "system");
+    }
+
+    #[test]
+    fn defaults_legacy_settings_language_and_rejects_unknown_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{"activeThemeId":"builtin.neutral-dark","lastCodexVersion":""}"#,
+        )
+        .unwrap();
+        let settings = SettingsStore::new(path);
+        let mut loaded = settings.load().unwrap();
+        assert_eq!(loaded.ui_language, "system");
+        loaded.ui_language = "unsupported".into();
+        assert!(settings.save(&loaded).is_err());
     }
 
     #[test]

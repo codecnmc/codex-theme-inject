@@ -78,6 +78,10 @@
 .ti-subcard > strong { display:block; margin-bottom:5px; font-size:12px; }
 .ti-theme-card { display:grid; grid-template-columns:42px 1fr auto; align-items:center; gap:10px; cursor:pointer; }
 .ti-theme-card[data-selected="true"] { border-color:var(--ti-accent); box-shadow:0 0 0 1px var(--ti-accent); }
+.ti-theme-card[data-switching="true"] { position:relative; border-color:var(--ti-accent); border-style:dashed; cursor:wait; box-shadow:0 0 0 1px color-mix(in srgb,var(--ti-accent) 60%,transparent); }
+.ti-theme-card[data-switching="true"]::after { content:""; position:absolute; right:13px; top:50%; width:15px; height:15px; margin-top:-8px; border:2px solid color-mix(in srgb,var(--ti-accent) 28%,transparent); border-top-color:var(--ti-accent); border-radius:50%; animation:ti-theme-switching .75s linear infinite; }
+.ti-theme-card[data-switching="true"] .ti-theme-menu { visibility:hidden; }
+@keyframes ti-theme-switching { to { transform:rotate(360deg); } }
 .ti-swatch { width:42px; height:42px; border-radius:9px; border:1px solid var(--ti-border); }
 .ti-theme-thumbnail { position:relative; overflow:hidden; }
 .ti-theme-thumbnail img { width:100%; height:100%; object-fit:contain; opacity:0; transition:opacity .18s ease; }

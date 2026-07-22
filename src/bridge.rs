@@ -391,6 +391,7 @@ fn valid_method(method: &str) -> bool {
             | "ai.generate"
             | "ai.resource.generate"
             | "theme.state.get"
+            | "app.language.save"
             | "app.trigger.save"
             | "app.trigger.icon.import"
             | "app.trigger.icon.reset"
@@ -433,6 +434,7 @@ mod tests {
         assert!(valid_method("ai.generate"));
         assert!(valid_method("ai.resource.generate"));
         assert!(valid_method("app.trigger.save"));
+        assert!(valid_method("app.language.save"));
         assert!(valid_method("app.trigger.icon.import"));
         assert!(valid_method("theme.package.metadata"));
         assert!(valid_method("ai.progress.get"));

@@ -35,7 +35,10 @@ jobs:
           "tag=v$version" >> $env:GITHUB_OUTPUT
 
       - name: 运行测试
-        run: cargo test --locked
+        shell: pwsh
+        run: |
+          cargo test --locked
+          node scripts/check-runtime.mjs
 
       - name: 构建精简 Release
         run: cargo build --release --locked
@@ -48,6 +51,7 @@ jobs:
           New-Item -ItemType Directory -Path $packageDirectory -Force | Out-Null
           Copy-Item "target/release/theme-inject.exe" $packageDirectory
           Copy-Item "README.md" $packageDirectory
+          Copy-Item "README.en.md" $packageDirectory
           Compress-Archive -Path "$packageDirectory/*" -DestinationPath "dist/$packageName.zip" -CompressionLevel Optimal
           Get-Item "target/release/theme-inject.exe", "dist/$packageName.zip" | Select-Object Name,Length
 
