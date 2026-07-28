@@ -648,6 +648,39 @@ impl Default for TerminalTheme {
 }
 
 impl ThemeManifest {
+    pub fn companion_pet_id(&self) -> Option<&str> {
+        self.extensions
+            .get("themeInject")
+            .and_then(Value::as_object)
+            .and_then(|extension| extension.get("companionPetId"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+    }
+
+    pub fn set_companion_pet_id(&mut self, id: Option<&str>) -> anyhow::Result<()> {
+        if let Some(id) = id {
+            crate::pet::validate_pet_id(id)?;
+            let extension = self
+                .extensions
+                .entry("themeInject".into())
+                .or_insert_with(|| json!({}));
+            let extension = extension
+                .as_object_mut()
+                .context("themeInject 扩展必须是对象")?;
+            extension.insert("companionPetId".into(), json!(id));
+        } else if let Some(extension) = self
+            .extensions
+            .get_mut("themeInject")
+            .and_then(Value::as_object_mut)
+        {
+            extension.remove("companionPetId");
+            if extension.is_empty() {
+                self.extensions.remove("themeInject");
+            }
+        }
+        Ok(())
+    }
+
     pub fn from_slice_migrated(bytes: &[u8]) -> anyhow::Result<Self> {
         let value: Value = serde_json::from_slice(bytes).context("theme.json 格式无效")?;
         Self::from_value_migrated(value)
@@ -708,6 +741,9 @@ impl ThemeManifest {
         }
         if let Some(path) = &self.custom_css {
             validate_relative_asset_path(path)?;
+        }
+        if let Some(id) = self.companion_pet_id() {
+            crate::pet::validate_pet_id(id)?;
         }
         self.background.validate()?;
         self.chrome.validate()?;
@@ -1261,6 +1297,22 @@ mod tests {
         ] {
             theme.validate().unwrap();
         }
+    }
+
+    #[test]
+    fn companion_pet_binding_round_trips_in_extensions() {
+        let mut theme = ThemeManifest::neutral_dark();
+        theme.set_companion_pet_id(Some("theme-pet")).unwrap();
+        assert_eq!(theme.companion_pet_id(), Some("theme-pet"));
+        let value = serde_json::to_value(&theme).unwrap();
+        assert_eq!(value["themeInject"]["companionPetId"], "theme-pet");
+        let restored = ThemeManifest::from_value_migrated(value).unwrap();
+        assert_eq!(restored.companion_pet_id(), Some("theme-pet"));
+
+        theme.set_companion_pet_id(None).unwrap();
+        assert_eq!(theme.companion_pet_id(), None);
+        assert!(!theme.extensions.contains_key("themeInject"));
+        assert!(theme.set_companion_pet_id(Some("INVALID PET")).is_err());
     }
 
     #[test]

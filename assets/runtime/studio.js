@@ -96,6 +96,12 @@
     clearTimeout(studioDomTimer);
     studioDomTimer = 0;
     document.querySelector(".ti-studio-backdrop")?.remove();
+    if (busy && ["theme", "resource"].includes(activeGenerationKind)) {
+      hidePanel();
+      syncGenerationIsland();
+      studioTimer = setTimeout(() => void pollGenerationProgress(generationEpoch), 300);
+      return;
+    }
     if (studioBaseline) {
       const discardedAssets = stagingAssets;
       const baselineKeys = new Set(studioBaseline.stagingAssets.map(asset => `${asset.session}:${asset.path}`));
@@ -123,6 +129,7 @@
   }
 
   function renderStudio(refreshDom = false) {
+    syncGenerationIsland();
     if (destroyed || !studioOpen || !draft) return;
     if (aiStudioMode === "edit" && studioTab === "generate") studioTab = "resources";
     const decorationCount = draft.skin?.decorations?.length || 0;
@@ -244,6 +251,8 @@
     const previewStyle = document.createElement("style");
     previewStyle.id = STYLE_ID;
     previewStyle.textContent = `${themeCss(draft, state?.customCssTrusted ? draftCustomCss : "")}
+*,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important;caret-color:transparent!important;}
+video,canvas{visibility:hidden!important;}
 button,[role="button"]{opacity:1!important;}
 .main-surface :is(button,[role="button"]){color:var(--ti-content-fg)!important;}
 :is([data-codex-composer-submit],[data-app-action-submit],[data-composer-navigation-target="submit"]),:is([data-codex-composer-submit],[data-app-action-submit],[data-composer-navigation-target="submit"]) *{color:var(--ti-accent-foreground)!important;}
@@ -293,7 +302,11 @@ button,[role="button"]{opacity:1!important;}
   function refreshStudioDom(studio, force) {
     const frame = studio.querySelector(".ti-studio-frame");
     if (!studioPreviewReady || !frame || (!force && frame.dataset.loaded === "true")) return;
-    frame.srcdoc = staticDomSnapshot();
+    const snapshot = staticDomSnapshot();
+    const signature = `${draft.id || ""}:${snapshot.length}:${snapshot.slice(-512)}`;
+    if (frame.dataset.loaded === "true" && signature === studioPreviewSignature) return;
+    studioPreviewSignature = signature;
+    frame.srcdoc = snapshot;
     frame.dataset.loaded = "true";
   }
 
@@ -415,7 +428,10 @@ button,[role="button"]{opacity:1!important;}
     studio.querySelector("[data-studio-generate-images]")?.addEventListener("change", event => { aiGenerateImages = event.target.checked; renderStudio(); });
     studio.querySelector("[data-studio-generate-watermark]")?.addEventListener("change", event => { aiGenerateSidebarWatermark = event.target.checked; });
     studio.querySelector("[data-studio-generate-system-icons]")?.addEventListener("change", event => { aiGenerateSystemIcons = event.target.checked; });
-    studio.querySelector("[data-studio-image-concurrency]")?.addEventListener("change", event => { aiImageConcurrency = Math.max(1, Math.min(4, Number(event.target.value) || 4)); });
+    studio.querySelectorAll("[data-studio-image-concurrency]").forEach(input => input.addEventListener("change", () => {
+      aiImageConcurrency = Math.max(1, Math.min(4, Number(input.value) || 4));
+      studio.querySelectorAll("[data-studio-image-concurrency]").forEach(peer => { peer.value = String(aiImageConcurrency); });
+    }));
     studio.querySelector("[data-studio-regenerate-palette]")?.addEventListener("click", () => void regeneratePaletteOnly());
     studio.querySelector("[data-studio-reference-select]")?.addEventListener("click", () => void chooseStudioReference());
     studio.querySelector("[data-studio-resource-reference-select]")?.addEventListener("click", () => void chooseStudioReference());
@@ -578,12 +594,12 @@ button,[role="button"]{opacity:1!important;}
     }));
   }
 
-  async function refreshReferencePreview(item) {
+  async function refreshReferencePreview(item, collection = aiReferences) {
     const url = await Promise.race([
       previewDataUrl(item, 2),
       new Promise(resolve => setTimeout(() => resolve(""), 8000)),
     ]);
-    if (destroyed || !aiReferences.includes(item)) return;
+    if (destroyed || !collection.includes(item)) return;
     item.previewUrl = url || "";
     item.previewState = url ? "loaded" : "failed";
     if (studioOpen) refreshStudioReferenceList();
@@ -914,14 +930,15 @@ button,[role="button"]{opacity:1!important;}
     if (!generationIsActive(epoch)) return;
     aiGenerationProgress = progress;
     aiRequestLog = logs;
-    const changed = await syncProgressAssets(progress, epoch);
+    syncGenerationIsland();
+    const changed = studioOpen ? await syncProgressAssets(progress, epoch) : false;
     if (!generationIsActive(epoch)) return;
     const signature = JSON.stringify([progress.state, progress.message, (progress.items || []).map(item => [item.slot, item.status, item.path, item.message]), aiRequestLog.length]);
     if (studioOpen && (changed || signature !== studioProgressSignature)) {
       studioProgressSignature = signature;
       refreshStudioProgress();
     }
-    if (generationIsActive(epoch) && studioOpen) studioTimer = setTimeout(() => void pollGenerationProgress(epoch), 500);
+    if (generationIsActive(epoch)) studioTimer = setTimeout(() => void pollGenerationProgress(epoch), 500);
   }
 
   function refreshStudioProgress() {

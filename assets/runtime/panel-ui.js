@@ -7,11 +7,12 @@
   }
 
   function panelHtml() {
-    return `<div class="ti-header"><div class="ti-header-brand"><img class="ti-brand-watermark" src="${TOOLBAR_ICON}" alt="Theme Inject" title="Theme Inject"><div><h2 class="ti-title">Codex 主题</h2><div class="ti-subtitle">实时定制 Codex 视觉系统</div></div></div><div class="ti-header-actions">${state?.development ? `<button class="ti-icon-button" data-action="reinject" title="构建备用开发版本，重启后重新注入">重新注入</button>` : ""}<button class="ti-icon-button" data-action="close">关闭</button></div></div><div class="ti-tabs">${tabs.map(([id, label]) => `<button class="ti-tab" data-tab="${id}" data-active="${id === activeTab}">${label}</button>`).join("")}</div><div class="ti-body">${tabs.map(([id]) => `<section class="ti-section" data-section="${id}" data-active="${id === activeTab}">${sectionHtml(id)}</section>`).join("")}</div><div class="ti-footer"><div class="ti-status" data-kind="${escapeHtml(statusKind)}">${escapeHtml(statusMessage || (dirty ? "有未应用修改" : "已同步"))}</div><div class="ti-footer-actions"><button class="ti-button" data-action="cancel">放弃</button><button class="ti-button" data-primary="true" data-action="apply">应用</button></div></div>${modalHtml()}`;
+    return `<div class="ti-header"><div class="ti-header-brand"><img class="ti-brand-watermark" src="${TOOLBAR_ICON}" alt="Theme Inject" title="Theme Inject"><div><h2 class="ti-title">Codex 主题</h2><div class="ti-subtitle">实时定制 Codex 视觉系统</div></div></div><div class="ti-header-actions">${state?.development ? `<button class="ti-icon-button" data-action="reinject" title="构建备用开发版本，重启后重新注入">重新注入</button>` : ""}<button class="ti-icon-button" data-action="close" ${activeGenerationKind ? "data-busy-allow title=\"关闭面板；生成任务会在后台继续\"" : ""}>关闭</button></div></div><div class="ti-tabs">${tabs.map(([id, label]) => `<button class="ti-tab" data-tab="${id}" data-active="${id === activeTab}">${label}</button>`).join("")}</div><div class="ti-body">${tabs.map(([id]) => `<section class="ti-section" data-section="${id}" data-active="${id === activeTab}">${sectionHtml(id)}</section>`).join("")}</div><div class="ti-footer"><div class="ti-status" data-kind="${escapeHtml(statusKind)}">${escapeHtml(statusMessage || (dirty ? "有未应用修改" : "已同步"))}</div>${activeTab === "pets" ? "" : `<div class="ti-footer-actions"><button class="ti-button" data-action="cancel">放弃</button><button class="ti-button" data-primary="true" data-action="apply">应用</button></div>`}</div>${modalHtml()}`;
   }
 
   function modalHtml() {
     if (!modal) return "";
+    if (modal.kind.startsWith("pet-")) return petModalHtml();
     if (modal.kind === "create") return `<div class="ti-modal-backdrop"><form class="ti-modal" data-modal-form="create"><div class="ti-modal-title">新建主题</div><div class="ti-modal-copy">以“${escapeHtml(draft.name)}”为基础创建一个可编辑副本。</div><label class="ti-field-label" for="ti-theme-name">主题名称</label><input id="ti-theme-name" class="ti-control" data-modal-name maxlength="80" value="${escapeHtml(modal.defaultValue)}" autocomplete="off"><div class="ti-modal-actions"><button class="ti-button" type="button" data-modal-cancel>取消</button><button class="ti-button" data-primary="true" type="submit">创建并切换</button></div></form></div>`;
     if (modal.kind === "delete") return `<div class="ti-modal-backdrop"><div class="ti-modal"><div class="ti-modal-title">删除主题</div><div class="ti-modal-copy">确定删除“${escapeHtml(modal.theme.name)}”？此操作无法撤销。</div><div class="ti-modal-actions"><button class="ti-button" type="button" data-modal-cancel>取消</button><button class="ti-button" data-danger="true" type="button" data-modal-confirm="delete">删除</button></div></div></div>`;
     if (modal.kind === "edit-theme") return `<div class="ti-modal-backdrop"><form class="ti-modal" data-modal-form="edit-theme"><div class="ti-modal-title">编辑主题信息</div><div class="ti-modal-copy">修改主题库中显示的名称和介绍。</div><label class="ti-field-label" for="ti-edit-theme-name">主题名称</label><input id="ti-edit-theme-name" class="ti-control" data-modal-theme-name maxlength="80" value="${escapeHtml(modal.theme.name)}" autocomplete="off"><label class="ti-field-label ti-section-gap" for="ti-edit-theme-description">主题介绍</label><textarea id="ti-edit-theme-description" class="ti-control ti-modal-textarea" data-modal-theme-description maxlength="240">${escapeHtml(modal.theme.description || "")}</textarea><div class="ti-modal-actions"><button class="ti-button" type="button" data-modal-cancel>取消</button><button class="ti-button" data-primary="true" type="submit">保存</button></div></form></div>`;
@@ -159,13 +160,25 @@
   }
 
   function studioReferenceListHtml() {
-    return aiReferences.length ? `<div class="ti-reference-grid">${aiReferences.map((item, index) => { const loading = item.previewState === "loading"; const failed = item.previewState === "failed"; return `<div class="ti-ai-reference"><div class="ti-ai-reference-image" data-loading="${loading}" data-failed="${failed}" style="${item.previewUrl ? `background-image:url(&quot;${escapeHtml(item.previewUrl)}&quot;)` : ""}"></div><div><strong>${escapeHtml(item.path?.split("/").pop() || `参考图 ${index + 1}`)}</strong><span>${loading ? "正在读取预览…" : failed ? "预览读取失败，生成时仍会使用原图" : `参考图 ${index + 1}`}</span><button class="ti-button" type="button" data-studio-reference-remove="${index}">移除</button></div></div>`; }).join("")}</div>` : `<div class="ti-studio-empty">可选：添加参考图分析配色、氛围和层级。也可以 Ctrl+V 直接粘贴图片。</div>`;
+    return referenceListHtml(aiReferences, "data-studio-reference-remove", "可选：添加参考图分析配色、氛围和层级。也可以 Ctrl+V 直接粘贴图片。");
+  }
+
+  function petReferenceListHtml(copy = "可选：最多 6 张宠物造型参考图。留空时自动复用主题参考图，再留空则只用文字描述。") {
+    return referenceListHtml(aiPetReferences, "data-pet-creator-reference-remove", copy);
+  }
+
+  function referenceListHtml(references, removeAttribute, emptyCopy) {
+    return references.length ? `<div class="ti-reference-grid">${references.map((item, index) => { const loading = item.previewState === "loading"; const failed = item.previewState === "failed"; return `<div class="ti-ai-reference"><div class="ti-ai-reference-image" data-loading="${loading}" data-failed="${failed}" style="${item.previewUrl ? `background-image:url(&quot;${escapeHtml(item.previewUrl)}&quot;)` : ""}"></div><div><strong>${escapeHtml(item.path?.split("/").pop() || `参考图 ${index + 1}`)}</strong><span>${loading ? "正在读取预览…" : failed ? "预览读取失败，生成时仍会使用原图" : `参考图 ${index + 1}`}</span><button class="ti-button" type="button" ${removeAttribute}="${index}">移除</button></div></div>`; }).join("")}</div>` : `<div class="ti-studio-empty">${escapeHtml(emptyCopy)}</div>`;
   }
 
   function refreshStudioReferenceList() {
     document.querySelectorAll("[data-studio-reference-list],[data-studio-resource-reference-list]").forEach(host => {
       host.innerHTML = studioReferenceListHtml();
       host.querySelectorAll("[data-studio-reference-remove]").forEach(button => button.addEventListener("click", () => void removeAiReference(Number(button.dataset.studioReferenceRemove))));
+    });
+    document.querySelectorAll("[data-pet-creator-reference-list]").forEach(host => {
+      host.innerHTML = petReferenceListHtml();
+      host.querySelectorAll("[data-pet-creator-reference-remove]").forEach(button => button.addEventListener("click", () => void removePetReference(Number(button.dataset.petCreatorReferenceRemove))));
     });
   }
 
@@ -181,6 +194,7 @@
   function sectionHtml(id) {
     if (!draft) return `<div class="ti-empty">正在读取主题…</div>`;
     if (id === "library") return libraryHtml();
+    if (id === "pets") return petLibraryHtml();
     if (id === "colors") return colorsHtml();
     if (id === "background") return backgroundHtml();
     if (id === "type") return `<div class="ti-card">${row("界面字体", textInput("typography.uiFont", draft.typography.uiFont))}${row("代码字体", textInput("typography.monoFont", draft.typography.monoFont))}${row("字号比例", rangeInput("typography.scale", draft.typography.scale, .8, 1.4, .01))}${row("行高", rangeInput("typography.lineHeight", draft.typography.lineHeight, 1.1, 2, .05))}</div>`;
@@ -199,7 +213,69 @@
 
   function advancedHtml() {
     const appearance = triggerAppearanceDraft || state.settings?.triggerAppearance || { shape:"rounded", size:40, right:18, bottom:18, backgroundOpacity:.88, shadowStrength:.35 };
-    return `<details class="ti-card ti-config-card" open><summary>右下角入口</summary><div class="ti-trigger-preview"><span style="${triggerStyle(appearance)}"><img src="${escapeHtml(state.triggerIcon || TOOLBAR_ICON)}" alt=""></span><div><strong>入口预览</strong><div class="ti-description">标题中的品牌水印固定不变；这里只调整右下角入口。</div></div></div>${row("形状", `<select class="ti-control" data-trigger-setting="shape"><option value="rounded" ${appearance.shape === "rounded" ? "selected" : ""}>圆角方形</option><option value="circle" ${appearance.shape === "circle" ? "selected" : ""}>圆形</option><option value="square" ${appearance.shape === "square" ? "selected" : ""}>方形</option></select>`)}${triggerRangeRow("尺寸", "size", appearance.size, 32, 72, 1)}${triggerRangeRow("右侧距离", "right", appearance.right, 0, 160, 1)}${triggerRangeRow("底部距离", "bottom", appearance.bottom, 0, 160, 1)}${triggerRangeRow("背景透明度", "backgroundOpacity", appearance.backgroundOpacity, .35, 1, .01)}${triggerRangeRow("阴影强度", "shadowStrength", appearance.shadowStrength, 0, 1, .01)}<div class="ti-action-group"><button class="ti-button" type="button" data-trigger-icon-import>选择自定义图标</button>${state.triggerIcon ? `<button class="ti-button" type="button" data-trigger-icon-reset>恢复默认图标</button>` : ""}<button class="ti-button" data-primary="true" type="button" data-trigger-save>保存入口设置</button></div></details><div class="ti-notice ti-section-gap"><strong>如何捕捉 CSS 位置</strong><ol class="ti-css-guide"><li>按 F12 或 Ctrl+Shift+I 打开开发者工具。</li><li>按 Ctrl+Shift+C 后点击要修改的位置。</li><li>在 Elements 面板右键节点，选择 Copy → Copy selector，再粘贴到下方。</li></ol><button class="ti-button ti-section-gap" type="button" data-css-inspector>直接在页面捕捉元素</button><div class="ti-description" data-css-selector-output>也可点击上方按钮，再点击 Codex 页面中的目标位置，选择器会自动写入 CSS。</div></div><div class="ti-notice ti-section-gap">自定义 CSS 可以隐藏或伪造页面内容。只有你完全信任的本地主题才应启用。</div><label class="ti-inline" style="margin:12px 0"><input type="checkbox" data-custom-css-enabled ${state.customCssTrusted ? "checked" : ""}>启用并信任自定义 CSS</label><textarea class="ti-textarea" data-custom-css spellcheck="false" placeholder="/* 示例：粘贴捕捉到的选择器 */&#10;.your-selector {&#10;  /* 在此添加样式 */&#10;}">${escapeHtml(draftCustomCss)}</textarea>`;
+    return updateHtml() + `<details class="ti-card ti-config-card" open><summary>右下角入口</summary><div class="ti-trigger-preview"><span style="${triggerStyle(appearance)}"><img src="${escapeHtml(state.triggerIcon || TOOLBAR_ICON)}" alt=""></span><div><strong>入口预览</strong><div class="ti-description">标题中的品牌水印固定不变；这里只调整右下角入口。</div></div></div>${row("形状", `<select class="ti-control" data-trigger-setting="shape"><option value="rounded" ${appearance.shape === "rounded" ? "selected" : ""}>圆角方形</option><option value="circle" ${appearance.shape === "circle" ? "selected" : ""}>圆形</option><option value="square" ${appearance.shape === "square" ? "selected" : ""}>方形</option></select>`)}${triggerRangeRow("尺寸", "size", appearance.size, 32, 72, 1)}${triggerRangeRow("右侧距离", "right", appearance.right, 0, 160, 1)}${triggerRangeRow("底部距离", "bottom", appearance.bottom, 0, 160, 1)}${triggerRangeRow("背景透明度", "backgroundOpacity", appearance.backgroundOpacity, .35, 1, .01)}${triggerRangeRow("阴影强度", "shadowStrength", appearance.shadowStrength, 0, 1, .01)}<div class="ti-action-group"><button class="ti-button" type="button" data-trigger-icon-import>选择自定义图标</button>${state.triggerIcon ? `<button class="ti-button" type="button" data-trigger-icon-reset>恢复默认图标</button>` : ""}<button class="ti-button" data-primary="true" type="button" data-trigger-save>保存入口设置</button></div></details><div class="ti-notice ti-section-gap"><strong>如何捕捉 CSS 位置</strong><ol class="ti-css-guide"><li>按 F12 或 Ctrl+Shift+I 打开开发者工具。</li><li>按 Ctrl+Shift+C 后点击要修改的位置。</li><li>在 Elements 面板右键节点，选择 Copy → Copy selector，再粘贴到下方。</li></ol><button class="ti-button ti-section-gap" type="button" data-css-inspector>直接在页面捕捉元素</button><div class="ti-description" data-css-selector-output>也可点击上方按钮，再点击 Codex 页面中的目标位置，选择器会自动写入 CSS。</div></div><div class="ti-notice ti-section-gap">自定义 CSS 可以隐藏或伪造页面内容。只有你完全信任的本地主题才应启用。</div><label class="ti-inline" style="margin:12px 0"><input type="checkbox" data-custom-css-enabled ${state.customCssTrusted ? "checked" : ""}>启用并信任自定义 CSS</label><textarea class="ti-textarea" data-custom-css spellcheck="false" placeholder="/* 示例：粘贴捕捉到的选择器 */&#10;.your-selector {&#10;  /* 在此添加样式 */&#10;}">${escapeHtml(draftCustomCss)}</textarea>`;
+  }
+
+  function updateHtml() {
+    if (!updateStatus) return `<section class="ti-card ti-update-card"><div class="ti-update-heading"><div><strong>程序更新</strong><div class="ti-description">正在读取版本信息…</div></div><span class="ti-update-spinner" aria-hidden="true"></span></div></section>`;
+    const phaseLabels = { idle:"尚未检查", checking:"正在检查", available:"发现新版本", "up-to-date":"已是最新版本", downloading:"正在下载", ready:"已下载并通过校验", installing:"正在安装", error:"更新失败" };
+    const latest = updateStatus.latest;
+    const percent = updateStatus.totalBytes ? Math.min(100, Math.round(updateStatus.downloadedBytes / updateStatus.totalBytes * 100)) : 0;
+    const checked = updateStatus.checkedAt ? new Date(updateStatus.checkedAt * 1000).toLocaleString() : "尚未检查";
+    const notes = latest?.notes?.trim() ? `<div class="ti-update-notes">${escapeHtml(latest.notes.trim().slice(0, 2400))}</div>` : "";
+    const progress = updateStatus.phase === "downloading" ? `<div class="ti-progress-track ti-update-progress"><span style="width:${percent}%"></span></div><div class="ti-update-meta"><span>${formatUpdateBytes(updateStatus.downloadedBytes)} / ${formatUpdateBytes(updateStatus.totalBytes)}</span><span>${percent}%</span></div>` : "";
+    let actions = `<button class="ti-button" type="button" data-update-check ${updateStatus.phase === "checking" || updateStatus.phase === "downloading" ? "disabled" : ""}>检查更新</button>`;
+    if (updateStatus.phase === "available" || (updateStatus.phase === "error" && latest)) actions += `<button class="ti-button" data-primary="true" type="button" data-update-download>下载更新</button>`;
+    if (updateStatus.phase === "downloading") actions += `<button class="ti-button" type="button" data-update-cancel>取消下载</button>`;
+    if (updateStatus.phase === "ready") actions += `<button class="ti-button" data-primary="true" type="button" data-update-install ${updateStatus.installSupported ? "" : "disabled"}>安装并重启</button>`;
+    const capability = updateStatus.installSupported ? "" : `<div class="ti-notice ti-update-notice">${escapeHtml(updateStatus.installReason || "当前构建不支持自动安装")}</div>`;
+    return `<section class="ti-card ti-update-card" data-update-phase="${escapeHtml(updateStatus.phase)}"><div class="ti-update-heading"><div><strong>程序更新</strong><div class="ti-description">当前版本 v${escapeHtml(updateStatus.currentVersion)}</div></div><span class="ti-badge">${escapeHtml(phaseLabels[updateStatus.phase] || updateStatus.phase)}</span></div>${latest ? `<div class="ti-update-version"><strong>${escapeHtml(latest.name || `Theme Inject v${latest.version}`)}</strong>${latest.publishedAt ? `<span>${escapeHtml(new Date(latest.publishedAt).toLocaleDateString())}</span>` : ""}</div>` : ""}${notes}${progress}${updateStatus.error ? `<div class="ti-update-error">${escapeHtml(updateStatus.error)}</div>` : ""}${capability}<div class="ti-update-footer"><span>上次检查：${escapeHtml(checked)}</span><div class="ti-action-group">${actions}</div></div></section>`;
+  }
+
+  function formatUpdateBytes(value) {
+    if (!Number.isFinite(value) || value <= 0) return "0 B";
+    if (value < 1024 * 1024) return `${Math.max(1, Math.round(value / 1024))} KB`;
+    return `${(value / 1024 / 1024).toFixed(1)} MB`;
+  }
+
+  async function refreshUpdateStatus(render = true) {
+    if (updateStatusLoading || destroyed) return;
+    updateStatusLoading = true;
+    try {
+      const next = await call("app.update.status");
+      const signature = JSON.stringify(next);
+      const changed = signature !== updateStatusSignature;
+      updateStatus = next;
+      updateStatusSignature = signature;
+      if (render && changed && activeTab === "advanced" && document.getElementById(PANEL_ID)?.dataset.open === "true") renderPanel();
+    } catch (error) {
+      setStatus(error?.message || "读取更新状态失败", "error");
+    } finally {
+      updateStatusLoading = false;
+      scheduleUpdatePoll();
+    }
+  }
+
+  function scheduleUpdatePoll() {
+    clearTimeout(updatePollTimer);
+    updatePollTimer = 0;
+    if (destroyed || activeTab !== "advanced" || document.getElementById(PANEL_ID)?.dataset.open !== "true") return;
+    const active = ["checking", "downloading", "installing"].includes(updateStatus?.phase);
+    updatePollTimer = setTimeout(() => void refreshUpdateStatus(), active ? 700 : 15000);
+  }
+
+  async function runUpdateCommand(method, message) {
+    try {
+      setStatus(message);
+      updateStatus = await call(method);
+      updateStatusSignature = JSON.stringify(updateStatus);
+      setStatus(method === "app.update.install" ? "正在安装并重启…" : "更新状态已刷新", "success");
+    } catch (error) {
+      setStatus(error?.message || "更新操作失败", "error");
+      await refreshUpdateStatus(false);
+    }
+    if (!destroyed && document.getElementById(PANEL_ID)?.dataset.open === "true") renderPanel();
+    scheduleUpdatePoll();
   }
 
   function triggerRangeRow(label, key, value, min, max, step) { return row(label, `<div class="ti-inline"><input class="ti-control" type="range" data-trigger-setting="${key}" value="${value}" min="${min}" max="${max}" step="${step}"><output>${rangeValue(value, step)}</output></div>`); }
@@ -210,7 +286,8 @@
     const cards = state.themes.map(theme => {
       const mode = theme.skin?.enabled ? "高级皮肤" : theme.background?.mode === "per-region" ? "分区背景" : activeBackgrounds(theme).some(([, background]) => hasBackground(background)) ? "全屏背景" : "";
       const switching = theme.id === switchingThemeId;
-      return `<div class="ti-card ti-theme-card" data-theme-activate="${escapeHtml(theme.id)}" data-selected="${theme.id === draft.id}" data-switching="${switching}" aria-busy="${switching}">${themeCardThumbnailHtml(theme)}<div><div class="ti-name">${escapeHtml(theme.name)}${mode ? `<span class="ti-badge">${mode}</span>` : ""}</div><div class="ti-description">${switching ? "正在切换…" : escapeHtml(theme.description || theme.id)}</div></div><details class="ti-theme-menu"><summary title="主题操作" aria-label="主题操作">•••</summary><div class="ti-theme-menu-popover"><button type="button" data-theme-edit="${escapeHtml(theme.id)}">编辑名称和介绍</button><button type="button" data-export="${escapeHtml(theme.id)}">导出主题</button><button type="button" data-theme-delete="${escapeHtml(theme.id)}" ${theme.id.startsWith("builtin.") ? "disabled title=\"内置主题不能删除\"" : ""}>删除主题</button></div></details></div>`;
+      const petId = theme.themeInject?.companionPetId;
+      return `<div class="ti-card ti-theme-card" data-theme-activate="${escapeHtml(theme.id)}" data-selected="${theme.id === draft.id}" data-switching="${switching}" aria-busy="${switching}">${themeCardThumbnailHtml(theme)}<div><div class="ti-name">${escapeHtml(theme.name)}${mode ? `<span class="ti-badge">${mode}</span>` : ""}${petId ? `<span class="ti-badge">配套宠物</span>` : ""}</div><div class="ti-description">${switching ? "正在切换…" : escapeHtml(theme.description || theme.id)}</div></div><details class="ti-theme-menu"><summary title="主题操作" aria-label="主题操作">•••</summary><div class="ti-theme-menu-popover"><button type="button" data-theme-edit="${escapeHtml(theme.id)}">编辑名称和介绍</button><button type="button" data-export="${escapeHtml(theme.id)}">导出主题${petId ? "和宠物" : ""}</button><button type="button" data-theme-delete="${escapeHtml(theme.id)}" ${theme.id.startsWith("builtin.") ? "disabled title=\"内置主题不能删除\"" : ""}>删除主题</button></div></details></div>`;
     }).join("");
     return `<div class="ti-notice" style="margin-bottom:10px">点击主题卡片即可切换；右侧菜单可编辑名称和介绍、导出或删除主题。</div>${actions}<div class="ti-grid">${cards}</div><div class="ti-inline" style="margin-top:10px"><button class="ti-button" data-action="clone">复制当前</button></div>`;
   }
@@ -342,7 +419,7 @@
     const focusAttribute = active ? focusAttributes.find(attribute => active.hasAttribute(attribute)) : null;
     return {
       scrollTop: body?.scrollTop || 0,
-      details: Object.fromEntries([...panel?.querySelectorAll(".ti-section") || []].map(section => [section.dataset.section, [...section.querySelectorAll("details")].map(detail => detail.open)])),
+      details: Object.fromEntries([...panel?.querySelectorAll(".ti-section") || []].map(section => [section.dataset.section, [...section.querySelectorAll("details:not(.ti-theme-menu)")].map(detail => detail.open)])),
       focus: focusAttribute ? {
         attribute: focusAttribute,
         value: active.getAttribute(focusAttribute),
@@ -355,7 +432,7 @@
   function restorePanelState(panel, previous) {
     if (!previous) return;
     Object.entries(previous.details).forEach(([sectionId, details]) => {
-      panel.querySelectorAll(`.ti-section[data-section="${sectionId}"] details`).forEach((detail, index) => { if (index < details.length) detail.open = details[index]; });
+      panel.querySelectorAll(`.ti-section[data-section="${sectionId}"] details:not(.ti-theme-menu)`).forEach((detail, index) => { if (index < details.length) detail.open = details[index]; });
     });
     const body = panel.querySelector(".ti-body");
     const restoreScroll = () => { if (body?.isConnected) body.scrollTop = previous.scrollTop; };
@@ -394,8 +471,14 @@
       body.addEventListener("scroll", () => { panelScrollTop = body.scrollTop; }, { passive: true });
     }
     restorePanelState(panel, previous);
+    syncGenerationIsland();
     if (modal?.kind === "create") queueMicrotask(() => panel.querySelector("[data-modal-name]")?.select());
     if (modal?.kind === "edit-theme") queueMicrotask(() => panel.querySelector("[data-modal-theme-name]")?.select());
+    if (modal?.kind === "pet-edit") queueMicrotask(() => panel.querySelector("[data-modal-pet-name]")?.select());
+  }
+
+  function closePanelMenus(panel) {
+    panel.querySelectorAll(".ti-theme-menu[open]").forEach(menu => { menu.open = false; });
   }
 
   function bindPanel(panel) {
@@ -411,7 +494,7 @@
       if (image.hasAttribute("src") && image.complete) settle(image.naturalWidth > 0);
     });
     panel.querySelectorAll(".ti-theme-thumbnail[data-theme-hero]").forEach(thumbnail => void loadThemeThumbnail(thumbnail));
-    panel.querySelectorAll("[data-tab]").forEach(button => button.onclick = () => { activeTab = button.dataset.tab; renderPanel(); });
+    panel.querySelectorAll("[data-tab]").forEach(button => button.onclick = () => { activeTab = button.dataset.tab; renderPanel(); if (activeTab === "pets") void hydratePetAssets(); if (activeTab === "advanced") void refreshUpdateStatus(); else { clearTimeout(updatePollTimer); updatePollTimer = 0; } });
     panel.querySelector('[data-action="close"]')?.addEventListener("click", closePanel);
     panel.querySelector('[data-action="reinject"]')?.addEventListener("click", () => void runAction("正在构建备用开发版本…", () => call("runtime.reinject"), "构建完成，正在重启并重新注入…"));
     panel.querySelector('[data-action="cancel"]')?.addEventListener("click", cancelPreview);
@@ -438,15 +521,16 @@
         popover.style.top = `${top}px`;
       }, 0);
     }));
-    panel.querySelector(".ti-body")?.addEventListener("scroll", () => panel.querySelectorAll(".ti-theme-menu[open]").forEach(menu => { menu.open = false; }), { passive: true });
-    panel.addEventListener("click", event => { if (event.target.closest(".ti-theme-menu")) return; panel.querySelectorAll(".ti-theme-menu[open]").forEach(menu => { menu.open = false; }); });
-    panel.querySelectorAll("[data-theme-edit]").forEach(button => button.onclick = event => { event.stopPropagation(); const theme = state.themes.find(item => item.id === button.dataset.themeEdit); if (theme) { modal = { kind:"edit-theme", theme:clone(theme) }; renderPanel(); } });
-    panel.querySelectorAll("[data-theme-delete]").forEach(button => button.onclick = event => { event.stopPropagation(); if (button.disabled) return; const theme = state.themes.find(item => item.id === button.dataset.themeDelete); if (theme) { modal = { kind:"delete", theme:clone(theme) }; renderPanel(); } });
-    panel.querySelectorAll("[data-export]").forEach(button => button.onclick = event => { event.stopPropagation(); void runAction("等待选择导出位置…", () => call("theme.package.export", { id: button.dataset.export }), "主题已导出"); });
+    panel.querySelector(".ti-body")?.addEventListener("scroll", () => closePanelMenus(panel), { passive: true });
+    panel.addEventListener("click", event => { if (event.target.closest(".ti-theme-menu")) return; closePanelMenus(panel); });
+    panel.querySelectorAll("[data-theme-edit]").forEach(button => button.onclick = event => { event.stopPropagation(); closePanelMenus(panel); const theme = state.themes.find(item => item.id === button.dataset.themeEdit); if (theme) { modal = { kind:"edit-theme", theme:clone(theme) }; renderPanel(); } });
+    panel.querySelectorAll("[data-theme-delete]").forEach(button => button.onclick = event => { event.stopPropagation(); if (button.disabled) return; closePanelMenus(panel); const theme = state.themes.find(item => item.id === button.dataset.themeDelete); if (theme) { modal = { kind:"delete", theme:clone(theme) }; renderPanel(); } });
+    panel.querySelectorAll("[data-export]").forEach(button => button.onclick = event => { event.stopPropagation(); closePanelMenus(panel); void runAction("等待选择导出位置…", () => call("theme.package.export", { id: button.dataset.export }), "主题已导出"); });
     panel.querySelector("[data-modal-cancel]")?.addEventListener("click", () => { modal = null; renderPanel(); });
     panel.querySelector('[data-modal-form="create"]')?.addEventListener("submit", event => { event.preventDefault(); const name = panel.querySelector("[data-modal-name]")?.value.trim(); if (!name) { setStatus("请输入主题名称", "error"); return; } void runAction("正在创建主题…", async () => { const theme = await call("theme.package.create", { sourceId: draft.id, name }); state = await call("theme.activate", { id: theme.id }); draft = clone(state.activeTheme); snapshot = clone(state.activeTheme); draftCustomCss = state.customCss || ""; dirty = false; modal = null; await hydrateAssets(draft); applyTheme(draft, state.customCssTrusted ? draftCustomCss : ""); }, "主题已创建并切换"); });
     panel.querySelector('[data-modal-form="edit-theme"]')?.addEventListener("submit", event => { event.preventDefault(); const name = panel.querySelector("[data-modal-theme-name]")?.value.trim(); const description = panel.querySelector("[data-modal-theme-description]")?.value.trim() || ""; if (!name) { setStatus("请输入主题名称", "error"); return; } void runAction("正在保存主题信息…", async () => { const updated = await call("theme.package.metadata", { id:modal.theme.id, name, description }); state.themes = state.themes.map(theme => theme.id === updated.id ? updated : theme); if (draft.id === updated.id) { draft.name = updated.name; draft.description = updated.description; snapshot.name = updated.name; snapshot.description = updated.description; state.activeTheme = clone(updated); } modal = null; }, "主题信息已保存"); });
     panel.querySelector('[data-modal-confirm="delete"]')?.addEventListener("click", () => void runAction("正在删除主题…", async () => { state = await call("theme.package.delete", { id: modal.theme.id }); draft = clone(state.activeTheme); snapshot = clone(state.activeTheme); draftCustomCss = state.customCss || ""; dirty = false; modal = null; await hydrateAssets(draft); applyTheme(draft, state.customCssTrusted ? draftCustomCss : ""); }, "主题已删除"));
+    bindPetLibraryEvents(panel);
     panel.querySelector('[data-modal-confirm="discard"]')?.addEventListener("click", () => void discardAndClose());
     panel.querySelector('[data-modal-confirm="apply"]')?.addEventListener("click", () => void applyAndClose());
     panel.querySelectorAll("[data-path]").forEach(input => input.addEventListener(input.tagName === "SELECT" || input.type === "checkbox" ? "change" : "input", () => { const value = input.type === "checkbox" ? input.checked : input.type === "number" || input.type === "range" ? Number(input.value) : input.value; setPath(draft, input.dataset.path, value); input.parentElement.querySelector("output")?.replaceChildren(input.type === "range" ? rangeValue(value, input.step) : input.value); markDirty(); if (input.type === "checkbox" || input.tagName === "SELECT") renderPanel(); }));
@@ -485,6 +569,14 @@
     panel.querySelector("[data-ui-language]")?.addEventListener("change", event => void runAction("正在保存语言设置…", async () => { state = await call("app.language.save", { language:event.target.value }); setUiLanguage(state.settings.uiLanguage); }, "语言设置已保存"));
     panel.querySelector("[data-trigger-icon-import]")?.addEventListener("click", () => void runAction("等待选择入口图标…", async () => { state = await call("app.trigger.icon.import"); triggerAppearanceDraft = clone(state.settings.triggerAppearance); applyTriggerAppearance(); }, "入口图标已更新"));
     panel.querySelector("[data-trigger-icon-reset]")?.addEventListener("click", () => void runAction("正在恢复默认图标…", async () => { state = await call("app.trigger.icon.reset"); triggerAppearanceDraft = clone(state.settings.triggerAppearance); applyTriggerAppearance(); }, "已恢复默认入口图标"));
+    panel.querySelector("[data-update-check]")?.addEventListener("click", () => void runUpdateCommand("app.update.check", "正在检查 GitHub Release…"));
+    panel.querySelector("[data-update-download]")?.addEventListener("click", () => void runUpdateCommand("app.update.download", "正在启动更新下载…"));
+    panel.querySelector("[data-update-cancel]")?.addEventListener("click", () => void runUpdateCommand("app.update.cancel", "正在取消更新下载…"));
+    panel.querySelector("[data-update-install]")?.addEventListener("click", () => void runUpdateCommand("app.update.install", "正在准备安装更新…"));
+    if (activeTab === "advanced") {
+      if (!updateStatus) void refreshUpdateStatus();
+      else scheduleUpdatePoll();
+    }
   }
 
   async function switchTheme(id) {
@@ -716,6 +808,26 @@
 
   async function removeAiReference(index, render = true) {
     const [removed] = aiReferences.splice(index, 1);
+    if (removed) { thumbnailUrls.delete(previewCacheKey(removed)); thumbnailUrls.delete(removed.path); await call("theme.preview.cancel", { session: removed.session }).catch(() => {}); }
+    if (render) refreshStudioReferenceList();
+  }
+
+  async function addPetReferences(items) {
+    const existing = new Set(aiPetReferences.map(item => `${item.session}:${item.path}`));
+    for (const item of items.filter(Boolean)) {
+      if (!item.session || !item.path || existing.has(`${item.session}:${item.path}`)) continue;
+      if (aiPetReferences.length >= 6) break;
+      item.previewUrl = "";
+      item.previewState = "loading";
+      aiPetReferences.push(item);
+      existing.add(`${item.session}:${item.path}`);
+      void refreshReferencePreview(item, aiPetReferences);
+    }
+    refreshStudioReferenceList();
+  }
+
+  async function removePetReference(index, render = true) {
+    const [removed] = aiPetReferences.splice(index, 1);
     if (removed) { thumbnailUrls.delete(previewCacheKey(removed)); thumbnailUrls.delete(removed.path); await call("theme.preview.cancel", { session: removed.session }).catch(() => {}); }
     if (render) refreshStudioReferenceList();
   }

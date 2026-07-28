@@ -6,9 +6,12 @@ mod bridge;
 mod cdp;
 mod diagnostic;
 mod launcher;
+mod pet;
+mod pet_package;
 mod storage;
 mod theme;
 mod theme_package;
+mod updater;
 mod watchdog;
 mod windows_app;
 mod windows_dialog;
@@ -21,7 +24,7 @@ use launcher::{LaunchOptions, ThemeLauncher};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    if windows_app::run_internal_command(&args)? {
+    if updater::run_internal_command(&args)? || windows_app::run_internal_command(&args)? {
         return Ok(());
     }
     let options = parse_args(args.into_iter())?;

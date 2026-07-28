@@ -386,7 +386,7 @@ pub fn codex_is_running() -> bool {
 pub async fn running_debug_port() -> Option<u16> {
     #[cfg(windows)]
     {
-        let script = r#"$process = Get-CimInstance Win32_Process | Where-Object { ($_.Name -eq 'ChatGPT.exe' -or $_.Name -eq 'Codex.exe') -and $_.CommandLine -match '--remote-debugging-port=(\d+)' } | Select-Object -First 1; if ($process -and $process.CommandLine -match '--remote-debugging-port=(\d+)') { $matches[1] }"#;
+        let script = r#"$processes = Get-CimInstance Win32_Process | Where-Object { ($_.Name -eq 'ChatGPT.exe' -or $_.Name -eq 'Codex.exe') -and $_.CommandLine -match '--remote-debugging-port=(\d+)' }; $processes | ForEach-Object { if ($_.CommandLine -match '--remote-debugging-port=(\d+)') { $matches[1] } } | Sort-Object -Unique"#;
         let mut command = tokio::process::Command::new("powershell");
         command
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
@@ -401,7 +401,16 @@ pub async fn running_debug_port() -> Option<u16> {
         if !output.status.success() {
             return None;
         }
-        String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+        let candidates = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<u16>().ok())
+            .collect::<Vec<_>>();
+        for port in candidates {
+            if crate::cdp::list_targets(port).await.is_ok() {
+                return Some(port);
+            }
+        }
+        None
     }
     #[cfg(not(windows))]
     {

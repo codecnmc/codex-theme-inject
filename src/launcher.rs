@@ -10,12 +10,17 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc};
 
-use crate::ai::{AiPublicSettings, AiThemeService, GenerateRequest, GenerateResourceRequest};
+use crate::ai::{
+    AiPublicSettings, AiThemeService, ApplyPetActionRequest, GeneratePetActionRequest,
+    GeneratePetRequest, GenerateRequest, GenerateResourceRequest, SuggestPetActionPromptsRequest,
+};
 use crate::asset_server::AssetServer;
 use crate::bridge::{BridgeHandle, RpcHandler};
+use crate::pet_package::PetPackageManager;
 use crate::storage::{AppPaths, SettingsStore, ThemeStore, TriggerAppearance};
 use crate::theme::ThemeManifest;
 use crate::theme_package::ThemePackageManager;
+use crate::updater::UpdateManager;
 
 const INSTANCE_PORT: u16 = 47631;
 
@@ -148,6 +153,14 @@ impl ThemeLauncher {
         if let Some(path) = &options.app_path {
             relaunch_args.extend(["--app-path".to_string(), path.display().to_string()]);
         }
+        let state_lock = Arc::new(Mutex::new(()));
+        let updater = UpdateManager::new(
+            self.themes.paths.clone(),
+            self.settings.clone(),
+            state_lock.clone(),
+            restart_requested.clone(),
+            relaunch_args.clone(),
+        )?;
         let ai = AiThemeService::new(
             self.themes.paths.clone(),
             asset_server.base_url(),
@@ -159,11 +172,13 @@ impl ThemeLauncher {
             ai,
             asset_base: asset_server.base_url(),
             asset_token: asset_server.token.clone(),
-            state_lock: Mutex::new(()),
+            state_lock,
             restart_requested: restart_requested.clone(),
             relaunch_args,
             generation_active: generation_active.clone(),
+            updater: updater.clone(),
         });
+        tokio::spawn(async move { updater.check_if_due().await });
         let handler = rpc_handler(service);
         let script = runtime_script()?;
         let (mut websocket_url, mut bridge) = install_initial_runtime(
@@ -213,8 +228,15 @@ impl ThemeLauncher {
         bridge: &mut BridgeHandle,
         mut command_rx: mpsc::UnboundedReceiver<String>,
     ) {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        // CDP health checks are a recovery mechanism, not a per-frame poll. A
+        // slightly longer interval also leaves the renderer room to drain its
+        // event queue after a large RPC response.
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
         let mut process_missing_ticks = 0u8;
+        let mut health_failures = 0u8;
+        let mut bridge_finished_ticks = 0u8;
+        let mut auto_reinstall_attempts = 0u8;
+        let mut next_auto_reinstall = tokio::time::Instant::now();
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -228,25 +250,70 @@ impl ThemeLauncher {
                     let target = crate::cdp::list_targets(debug_port).await.ok().and_then(|targets| crate::cdp::pick_codex_target(&targets).ok());
                     let next_url = target.and_then(|target| target.websocket_url);
                     let requested = runtime.reinject_requested.swap(false, Ordering::SeqCst);
-                    let requires_reinstall = requested || bridge.is_finished() || match next_url.as_deref() {
-                        Some(next_url) if next_url == websocket_url => !crate::watchdog::healthy(websocket_url).await,
-                        Some(_) => true,
-                        None => false,
+                    let bridge_finished = bridge.is_finished();
+                    if bridge_finished {
+                        bridge_finished_ticks = bridge_finished_ticks.saturating_add(1);
+                    } else {
+                        bridge_finished_ticks = 0;
+                    }
+                    let target_changed = next_url.as_deref().is_some_and(|url| url != websocket_url);
+                    let health_failed = if !requested && !target_changed && next_url.is_some() {
+                        let healthy = crate::watchdog::healthy(websocket_url).await;
+                        if healthy {
+                            health_failures = 0;
+                            if !bridge_finished {
+                                auto_reinstall_attempts = 0;
+                            }
+                        } else {
+                            health_failures = health_failures.saturating_add(1);
+                        }
+                        health_failures >= 2
+                    } else {
+                        false
                     };
-                    if requires_reinstall && let Some(next_url) = next_url {
+                    let bridge_unresponsive = bridge_finished_ticks >= 2;
+                    let requires_reinstall = requested || target_changed || bridge_unresponsive || health_failed;
+                    let auto_retry_allowed = requested || tokio::time::Instant::now() >= next_auto_reinstall;
+                    if requires_reinstall && auto_retry_allowed && let Some(next_url) = next_url {
+                        crate::diagnostic::log(
+                            "watchdog.reinstall_started",
+                            json!({
+                                "requested": requested,
+                                "targetChanged": target_changed,
+                                "bridgeFinishedTicks": bridge_finished_ticks,
+                                "healthFailures": health_failures,
+                                "autoRetry": !requested,
+                            }),
+                        );
                         let placeholder = std::mem::replace(bridge, inert_bridge());
                         placeholder.shutdown(websocket_url).await;
                         match crate::bridge::install(&next_url, &runtime.nonce, &runtime.script, runtime.handler.clone()).await {
                             Ok(next_bridge) => {
                                 *bridge = next_bridge;
                                 *websocket_url = next_url;
+                                bridge_finished_ticks = 0;
+                                health_failures = 0;
+                                let backoff_seconds = if requested {
+                                    auto_reinstall_attempts = 0;
+                                    next_auto_reinstall = tokio::time::Instant::now();
+                                    0
+                                } else {
+                                    auto_reinstall_attempts = auto_reinstall_attempts.saturating_add(1).min(6);
+                                    let seconds = 10u64.saturating_mul(1u64 << auto_reinstall_attempts);
+                                    next_auto_reinstall = tokio::time::Instant::now()
+                                        + Duration::from_secs(seconds.min(120));
+                                    seconds.min(120)
+                                };
                                 if requested {
                                     let _ = crate::watchdog::open_panel(websocket_url).await;
                                 }
-                                crate::diagnostic::log("watchdog.reinjected", json!({ "requested": requested }));
-                            }
+                                crate::diagnostic::log("watchdog.reinjected", json!({ "requested": requested, "backoffSeconds": backoff_seconds }));
+                                }
                                 Err(error) => {
-                                    runtime.reinject_requested.store(true, Ordering::SeqCst);
+                                    if requested {
+                                        runtime.reinject_requested.store(true, Ordering::SeqCst);
+                                    }
+                                    next_auto_reinstall = tokio::time::Instant::now() + Duration::from_secs(30);
                                     crate::diagnostic::log("watchdog.reinject_failed", json!({ "message": format!("{error:#}") }));
                                 }
                         }
@@ -391,10 +458,11 @@ struct ThemeService {
     ai: AiThemeService,
     asset_base: String,
     asset_token: String,
-    state_lock: Mutex<()>,
+    state_lock: Arc<Mutex<()>>,
     restart_requested: Arc<AtomicBool>,
     relaunch_args: Vec<String>,
     generation_active: Arc<AtomicBool>,
+    updater: UpdateManager,
 }
 
 struct RuntimeInstall {
@@ -417,7 +485,20 @@ impl ThemeService {
     async fn call(&self, method: &str, params: Value) -> anyhow::Result<Value> {
         let _guard = if matches!(
             method,
-            "ai.generate" | "ai.resource.generate" | "ai.generation.cancel"
+            "ai.generate"
+                | "ai.resource.generate"
+                | "ai.pet.generate"
+                | "ai.pet.base.generate"
+                | "ai.pet.actions.generate"
+                | "ai.pet.publish"
+                | "ai.pet.action.generate"
+                | "ai.pet.action.prompts.suggest"
+                | "ai.generation.cancel"
+                | "app.update.status"
+                | "app.update.check"
+                | "app.update.download"
+                | "app.update.cancel"
+                | "app.update.install"
         ) {
             None
         } else {
@@ -432,6 +513,18 @@ impl ThemeService {
                     string_param(&params, "foreground")?,
                 )?;
                 Ok(json!({ "applied": true }))
+            }
+            "app.update.status" => Ok(serde_json::to_value(self.updater.status().await)?),
+            "app.update.check" => Ok(serde_json::to_value(self.updater.check().await?)?),
+            "app.update.download" => {
+                Ok(serde_json::to_value(self.updater.start_download().await?)?)
+            }
+            "app.update.cancel" => Ok(serde_json::to_value(self.updater.cancel().await)?),
+            "app.update.install" => {
+                if self.generation_active.load(Ordering::SeqCst) {
+                    bail!("AI 生成任务仍在运行，请等待完成或先取消生成");
+                }
+                Ok(serde_json::to_value(self.updater.install().await?)?)
             }
             "ai.settings.get" => Ok(serde_json::to_value(self.ai.public_settings()?)?),
             "ai.log.get" => Ok(serde_json::to_value(self.ai.request_log())?),
@@ -521,6 +614,66 @@ impl ThemeService {
                 let result = self.ai.generate_resource(request).await;
                 Ok(serde_json::to_value(result?)?)
             }
+            "ai.pet.generate" => {
+                let request: GeneratePetRequest =
+                    serde_json::from_value(params).context("AI 宠物生成参数格式无效")?;
+                let _generation_guard = GenerationActiveGuard::acquire(&self.generation_active)?;
+                let result = self.ai.generate_pet(request).await;
+                Ok(serde_json::to_value(result?)?)
+            }
+            "ai.pet.base.generate" => {
+                let request: GeneratePetRequest =
+                    serde_json::from_value(params).context("AI 宠物基础形象参数格式无效")?;
+                let _generation_guard = GenerationActiveGuard::acquire(&self.generation_active)?;
+                Ok(serde_json::to_value(
+                    self.ai.generate_pet_base(request).await?,
+                )?)
+            }
+            "ai.pet.actions.generate" => {
+                let request: GeneratePetRequest =
+                    serde_json::from_value(params).context("AI 宠物动作参数格式无效")?;
+                let _generation_guard = GenerationActiveGuard::acquire(&self.generation_active)?;
+                Ok(serde_json::to_value(
+                    self.ai.generate_pet_actions(request).await?,
+                )?)
+            }
+            "ai.pet.publish" => {
+                let request: GeneratePetRequest =
+                    serde_json::from_value(params).context("宠物发布参数格式无效")?;
+                let _generation_guard = GenerationActiveGuard::acquire(&self.generation_active)?;
+                Ok(serde_json::to_value(self.ai.publish_pet(request).await?)?)
+            }
+            "ai.pet.restore" => Ok(serde_json::to_value(
+                self.ai
+                    .restore_pet_generation(string_param(&params, "themeId")?)?,
+            )?),
+            "ai.pet.discard" => Ok(json!({
+                "discarded": self
+                    .ai
+                    .discard_pet_generation(string_param(&params, "themeId")?)?
+            })),
+            "ai.pet.action.generate" => {
+                let request: GeneratePetActionRequest =
+                    serde_json::from_value(params).context("AI 宠物动作生成参数格式无效")?;
+                let _generation_guard = GenerationActiveGuard::acquire(&self.generation_active)?;
+                Ok(serde_json::to_value(
+                    self.ai.generate_pet_action_candidate(request).await?,
+                )?)
+            }
+            "ai.pet.action.prompts.suggest" => {
+                let request: SuggestPetActionPromptsRequest =
+                    serde_json::from_value(params).context("AI 宠物动作提示词参数格式无效")?;
+                Ok(serde_json::to_value(
+                    self.ai.suggest_pet_action_prompts(request).await?,
+                )?)
+            }
+            "ai.pet.action.apply" => {
+                let request: ApplyPetActionRequest =
+                    serde_json::from_value(params).context("宠物动作确认参数格式无效")?;
+                Ok(serde_json::to_value(
+                    self.ai.apply_pet_action_candidate(request)?,
+                )?)
+            }
             "ai.generation.save" => self.save_generated_theme(params),
             "theme.state.get" => self.state_value(),
             "app.language.save" => {
@@ -592,6 +745,87 @@ impl ThemeService {
                     self.settings.save(&settings)?;
                 }
                 packages.delete_theme(id, &settings.active_theme_id)?;
+                self.state_value()
+            }
+            "pet.library.list" => Ok(serde_json::to_value(
+                PetPackageManager::new(
+                    self.themes.paths.clone(),
+                    self.asset_base.clone(),
+                    self.asset_token.clone(),
+                )
+                .list()?,
+            )?),
+            "pet.library.data" => Ok(json!({
+                "url": PetPackageManager::new(
+                    self.themes.paths.clone(),
+                    self.asset_base.clone(),
+                    self.asset_token.clone(),
+                )
+                .data_url(string_param(&params, "id")?)?
+            })),
+            "pet.library.import" => Ok(serde_json::to_value(
+                PetPackageManager::new(
+                    self.themes.paths.clone(),
+                    self.asset_base.clone(),
+                    self.asset_token.clone(),
+                )
+                .import_dialog()
+                .await?,
+            )?),
+            "pet.library.export" => {
+                PetPackageManager::new(
+                    self.themes.paths.clone(),
+                    self.asset_base.clone(),
+                    self.asset_token.clone(),
+                )
+                .export_dialog(string_param(&params, "id")?)
+                .await?;
+                Ok(json!({ "status": "ok" }))
+            }
+            "pet.library.delete" => {
+                PetPackageManager::new(
+                    self.themes.paths.clone(),
+                    self.asset_base.clone(),
+                    self.asset_token.clone(),
+                )
+                .delete(string_param(&params, "id")?)?;
+                Ok(json!({ "status": "ok" }))
+            }
+            "pet.library.metadata" => Ok(serde_json::to_value(
+                PetPackageManager::new(
+                    self.themes.paths.clone(),
+                    self.asset_base.clone(),
+                    self.asset_token.clone(),
+                )
+                .update_metadata(
+                    string_param(&params, "id")?,
+                    string_param(&params, "name")?,
+                    string_param(&params, "description")?,
+                )?,
+            )?),
+            "pet.library.install" => {
+                let path = PetPackageManager::new(
+                    self.themes.paths.clone(),
+                    self.asset_base.clone(),
+                    self.asset_token.clone(),
+                )
+                .install(string_param(&params, "id")?)?;
+                Ok(json!({ "status": "ok", "path": path }))
+            }
+            "theme.pet.bind" => {
+                let theme_id = string_param(&params, "themeId")?;
+                let pet_id = params.get("petId").and_then(Value::as_str);
+                if let Some(pet_id) = pet_id {
+                    PetPackageManager::new(
+                        self.themes.paths.clone(),
+                        self.asset_base.clone(),
+                        self.asset_token.clone(),
+                    )
+                    .data_url(pet_id)?;
+                }
+                let mut theme = self.themes.load(theme_id)?;
+                theme.set_companion_pet_id(pet_id)?;
+                self.themes.save(&theme)?;
                 self.state_value()
             }
             "theme.background.import" => {
@@ -702,6 +936,11 @@ impl ThemeService {
             "settings": settings,
             "activeTheme": active,
             "themes": self.themes.list()?,
+            "pets": PetPackageManager::new(
+                self.themes.paths.clone(),
+                self.asset_base.clone(),
+                self.asset_token.clone(),
+            ).list()?,
             "triggerIcon": trigger_icon,
             "assetBase": self.asset_base,
             "assetToken": self.asset_token,
@@ -994,6 +1233,7 @@ fn runtime_script() -> anyhow::Result<String> {
         include_str!("../assets/theme-runtime.js"),
         include_str!("../assets/runtime/i18n.js"),
         include_str!("../assets/runtime/theme-renderer.js"),
+        include_str!("../assets/runtime/pets.js"),
         include_str!("../assets/runtime/panel-ui.js"),
         include_str!("../assets/runtime/ai-generation.js"),
         include_str!("../assets/runtime/ambient-effects.js"),
@@ -1034,6 +1274,7 @@ mod runtime_tests {
         let script = runtime_script().unwrap();
         let i18n = script.find("Runtime module: i18n").unwrap();
         let renderer = script.find("Runtime module: theme-renderer").unwrap();
+        let pets = script.find("Runtime module: pets").unwrap();
         let panel = script.find("Runtime module: panel-ui").unwrap();
         let generation = script.find("Runtime module: ai-generation").unwrap();
         let effects = script.find("Runtime module: ambient-effects").unwrap();
@@ -1041,7 +1282,8 @@ mod runtime_tests {
         let lifecycle = script.find("Runtime module: lifecycle").unwrap();
 
         assert!(i18n < renderer);
-        assert!(renderer < panel);
+        assert!(renderer < pets);
+        assert!(pets < panel);
         assert!(panel < generation);
         assert!(generation < effects);
         assert!(effects < studio);

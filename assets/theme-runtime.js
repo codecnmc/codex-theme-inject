@@ -10,6 +10,7 @@
   };
   const PANEL_ID = "theme-inject-panel";
   const TRIGGER_ID = "theme-inject-trigger";
+  const GENERATION_ISLAND_ID = "theme-inject-generation-island";
   const BRAND_ID = "theme-inject-brand";
   const HOME_ID = "theme-inject-home";
   const DECORATIONS_ID = "theme-inject-decorations";
@@ -42,6 +43,7 @@
   let activeTab = "library";
   let mutationTimer = 0;
   const pendingIconRoots = new Set();
+  const pendingRefresh = { layout: false, sidebar: false, icons: false, code: false };
   let draftPreviewTimer = 0;
   let draftPreviewDeadline = 0;
   let studioPreviewTimer = 0;
@@ -71,6 +73,29 @@
   let studioAssetPreview = null;
   let aiGenerateSidebarWatermark = false;
   let aiGenerateSystemIcons = false;
+  let aiPetName = "";
+  let aiPetDescription = "";
+  let aiPetPrompt = "";
+  let aiPetActionPrompt = "";
+  let aiPetActionPrompts = {};
+  let aiPetReferences = [];
+  let aiPetGenerationStage = "idle";
+  let aiPetBaseAsset = null;
+  let aiPetBasePreviewUrl = "";
+  let aiPetBasePreviewLoading = false;
+  let aiPetBasePreviewAttemptedKey = "";
+  let aiPetActionAssets = [];
+  let aiPetActionPreviewsLoading = false;
+  let petCreatorOpen = false;
+  let petCreatorMode = "";
+  let petCreatorRestoring = false;
+  let petCreatorRestoreEpoch = 0;
+  let petActionUseUploadedBase = false;
+  let petCreatorTimer = 0;
+  let petCreatorProgress = { state: "idle", items: [] };
+  let petCreatorRequestLog = [];
+  let petActionEditor = null;
+  let petActionPromptSuggestSlot = "";
   let aiImageConcurrency = 4;
   let aiLanguage = "zh-CN";
   let aiReferences = [];
@@ -85,6 +110,9 @@
   let studioProgressSignature = "";
   let generationEpoch = 0;
   let activeGenerationKind = "";
+  let generationIslandKind = "";
+  let generationIslandSignature = "";
+  let generationIslandDismissTimer = 0;
   let assetHydrationEpoch = 0;
   let assetCacheThemeId = "";
   let assetRetryTimer = 0;
@@ -99,6 +127,7 @@
   let studioPreviewRefreshPending = false;
   let studioPreviewReady = false;
   let studioPreviewPreparing = false;
+  let studioPreviewSignature = "";
   let studioBaseline = null;
   let panelScrollTop = 0;
   let studioPaneScrollTop = 0;
@@ -120,6 +149,13 @@
   let homeSignature = "";
   let cssInspectorCleanup = null;
   let triggerAppearanceDraft = null;
+  let updateStatus = null;
+  let updateStatusSignature = "";
+  let updateStatusLoading = false;
+  let updatePollTimer = 0;
+  let petPreviewAction = "idle";
+  const petAssetUrls = new Map();
+  const petAssetRequests = new Map();
   let rendererErrorReportAt = 0;
 
   if (window.__themeInjectRuntime?.destroy) window.__themeInjectRuntime.destroy();
@@ -137,11 +173,13 @@
     if (destroyed) return Promise.reject(new Error("Theme Inject reloaded"));
     return new Promise((resolve, reject) => {
       const id = `${Date.now()}-${++requestSequence}`;
-      const timeout = ["ai.generate", "ai.resource.generate", "runtime.reinject"].includes(method)
+      const timeout = ["ai.generate", "ai.resource.generate", "ai.pet.generate", "ai.pet.base.generate", "ai.pet.actions.generate", "ai.pet.publish", "ai.pet.action.generate", "ai.pet.action.prompts.suggest", "runtime.reinject"].includes(method)
         ? 25 * 60 * 1000
+        : method === "app.update.check"
+          ? 90 * 1000
         : ["theme.preview.data", "theme.preview.thumbnail", "theme.background.data"].includes(method)
           ? 2 * 60 * 1000
-          : ["theme.package.import", "theme.package.export", "theme.background.import", "theme.asset.import", "ai.reference.import", "ai.reference.upload", "app.trigger.icon.import"].includes(method)
+          : ["theme.package.import", "theme.package.export", "pet.library.import", "pet.library.export", "theme.background.import", "theme.asset.import", "ai.reference.import", "ai.reference.upload", "app.trigger.icon.import"].includes(method)
             ? 10 * 60 * 1000
             : 16000;
       const timer = setTimeout(() => {
@@ -176,7 +214,7 @@
   window.themeInject = { call };
 
   const tabs = [
-    ["library", "主题库"], ["colors", "颜色"], ["background", "背景"], ["type", "字体"],
+    ["library", "主题库"], ["pets", "宠物库"], ["colors", "颜色"], ["background", "背景"], ["type", "字体"],
     ["effects", "效果"], ["terminal", "终端"], ["skin", "皮肤"], ["ai", "AI 生成"], ["advanced", "高级"],
   ];
   const colorFields = [
@@ -275,7 +313,7 @@
     if (!aiWorkspaceThemeId) return;
     aiWorkspaceByTheme.set(aiWorkspaceThemeId, clone({
       aiPrompt, aiThemeName, aiThemeDescription, aiGenerateImages, aiStudioMode, aiUseCurrentResourceReference,
-      aiGenerateSidebarWatermark, aiGenerateSystemIcons, aiImageConcurrency, aiLanguage,
+      aiGenerateSidebarWatermark, aiGenerateSystemIcons, aiLanguage,
       aiRequestLog, aiResourcePlans, aiGenerationProgress, studioTab, studioResourceSlot, studioResourcePrompt, studioResourceCandidates,
     }));
   }
@@ -294,7 +332,6 @@
     aiUseCurrentResourceReference = workspace?.aiUseCurrentResourceReference ?? true;
     aiGenerateSidebarWatermark = workspace?.aiGenerateSidebarWatermark ?? false;
     aiGenerateSystemIcons = workspace?.aiGenerateSystemIcons ?? false;
-    aiImageConcurrency = workspace?.aiImageConcurrency || 4;
     aiLanguage = workspace?.aiLanguage || "zh-CN";
     aiRequestLog = clone(workspace?.aiRequestLog || []);
     aiResourcePlans = clone(workspace?.aiResourcePlans || []);

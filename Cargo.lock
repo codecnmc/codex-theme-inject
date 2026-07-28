@@ -1778,7 +1778,7 @@ dependencies = [
 
 [[package]]
 name = "theme-inject"
-version = "0.0.3"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",

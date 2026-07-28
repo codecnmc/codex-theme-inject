@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, bail};
 use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::theme::ThemeManifest;
 
@@ -13,11 +14,15 @@ pub struct AppPaths {
     pub settings: PathBuf,
     pub ai_settings: PathBuf,
     pub ai_generation: PathBuf,
+    pub ai_pet_generation: PathBuf,
     pub themes: PathBuf,
+    pub pets: PathBuf,
+    pub pet_backups: PathBuf,
     pub staging: PathBuf,
     pub logs: PathBuf,
     pub trust: PathBuf,
     pub trigger_icon: PathBuf,
+    pub updates: PathBuf,
 }
 
 impl AppPaths {
@@ -34,17 +39,29 @@ impl AppPaths {
             settings: root.join("settings.json"),
             ai_settings: root.join("ai-settings.json"),
             ai_generation: root.join("ai-generation.json"),
+            ai_pet_generation: root.join("ai-pet-generation.json"),
             themes: root.join("themes"),
+            pets: root.join("pets"),
+            pet_backups: root.join("pet-backups"),
             staging: root.join("staging"),
             logs: root.join("logs"),
             trust: root.join("trust.json"),
             trigger_icon: root.join("trigger-icon.png"),
+            updates: root.join("updates"),
             root,
         }
     }
 
     pub fn ensure(&self) -> anyhow::Result<()> {
-        for path in [&self.root, &self.themes, &self.staging, &self.logs] {
+        for path in [
+            &self.root,
+            &self.themes,
+            &self.pets,
+            &self.pet_backups,
+            &self.staging,
+            &self.logs,
+            &self.updates,
+        ] {
             fs::create_dir_all(path).with_context(|| format!("无法创建目录 {}", path.display()))?;
         }
         Ok(())
@@ -61,6 +78,12 @@ pub struct AppSettings {
     pub ui_language: String,
     #[serde(default)]
     pub trigger_appearance: TriggerAppearance,
+    #[serde(default)]
+    pub last_update_check_at: u64,
+    #[serde(default)]
+    pub skipped_update_version: String,
+    #[serde(default)]
+    pub downloaded_update_version: String,
 }
 
 fn default_ui_language() -> String {
@@ -141,6 +164,9 @@ impl Default for AppSettings {
             last_codex_version: String::new(),
             ui_language: default_ui_language(),
             trigger_appearance: TriggerAppearance::default(),
+            last_update_check_at: 0,
+            skipped_update_version: String::new(),
+            downloaded_update_version: String::new(),
         }
     }
 }
@@ -272,24 +298,39 @@ impl ThemeStore {
         if !self.paths.staging.exists() {
             return Ok(());
         }
-        let preserved = fs::read(&self.paths.ai_generation)
+        let mut preserved = fs::read(&self.paths.ai_generation)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-            .and_then(|value| {
-                value
-                    .get("assets")
-                    .and_then(|assets| assets.as_array())
-                    .cloned()
-            })
+            .and_then(|value| value.get("assets").and_then(Value::as_array).cloned())
             .unwrap_or_default()
             .into_iter()
             .filter_map(|asset| {
                 asset
                     .get("session")
-                    .and_then(|value| value.as_str())
+                    .and_then(Value::as_str)
                     .map(str::to_owned)
             })
             .collect::<std::collections::BTreeSet<_>>();
+        if let Some(checkpoint) = fs::read(&self.paths.ai_pet_generation)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        {
+            if let Some(session) = checkpoint.get("session").and_then(Value::as_str) {
+                preserved.insert(session.to_string());
+            }
+            if let Some(references) = checkpoint
+                .get("request")
+                .and_then(|request| request.get("references"))
+                .and_then(Value::as_array)
+            {
+                preserved.extend(references.iter().filter_map(|reference| {
+                    reference
+                        .get("session")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                }));
+            }
+        }
         for entry in fs::read_dir(&self.paths.staging)? {
             let path = entry?.path();
             if path
@@ -385,6 +426,42 @@ mod tests {
             TriggerAppearance::default()
         );
         assert_eq!(settings.load().unwrap().ui_language, "system");
+        assert_eq!(settings.load().unwrap().last_update_check_at, 0);
+        assert!(
+            settings
+                .load()
+                .unwrap()
+                .downloaded_update_version
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cleanup_preserves_pet_checkpoint_and_reference_sessions() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_root(temp.path().join("ThemeInject"));
+        paths.ensure().unwrap();
+        let pet_session = "a".repeat(32);
+        let reference_session = "b".repeat(32);
+        let unrelated_session = "c".repeat(32);
+        for session in [&pet_session, &reference_session, &unrelated_session] {
+            fs::create_dir_all(paths.staging.join(session)).unwrap();
+            fs::write(paths.staging.join(session).join("data.png"), b"x").unwrap();
+        }
+        fs::write(
+            &paths.ai_pet_generation,
+            serde_json::to_vec(&serde_json::json!({
+                "session": pet_session,
+                "request": { "references": [{ "session": reference_session, "path": "data.png" }] }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        ThemeStore::new(paths.clone()).cleanup_staging().unwrap();
+        assert!(paths.staging.join("a".repeat(32)).exists());
+        assert!(paths.staging.join("b".repeat(32)).exists());
+        assert!(!paths.staging.join("c".repeat(32)).exists());
     }
 
     #[test]

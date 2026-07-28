@@ -99,6 +99,8 @@ async fn handle(
     let relative = path.trim_start_matches('/');
     let (root, relative) = if let Some(relative) = relative.strip_prefix("assets/") {
         (&paths.themes, relative)
+    } else if let Some(relative) = relative.strip_prefix("pets/") {
+        (&paths.pets, relative)
     } else if let Some(relative) = relative.strip_prefix("staging/") {
         (&paths.staging, relative)
     } else {
@@ -182,5 +184,13 @@ mod tests {
     fn rejects_parent_paths() {
         let temp = tempfile::tempdir().unwrap();
         assert!(safe_file(temp.path(), "../secret.png").is_err());
+    }
+
+    #[test]
+    fn recognizes_webp_pet_assets() {
+        assert_eq!(
+            image_content_type(Path::new("spritesheet.webp")),
+            Some("image/webp")
+        );
     }
 }

@@ -34,6 +34,16 @@ jobs:
           "version=$version" >> $env:GITHUB_OUTPUT
           "tag=v$version" >> $env:GITHUB_OUTPUT
 
+      - name: 检查版本标签未被占用
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.version.outputs.tag }}"
+          gh release view $tag --repo "${{ github.repository }}" *> $null
+          if ($LASTEXITCODE -eq 0) { throw "Release $tag 已存在，请先提升 Cargo.toml 版本" }
+          $global:LASTEXITCODE = 0
+
       - name: 运行测试
         shell: pwsh
         run: |
@@ -47,19 +57,41 @@ jobs:
         shell: pwsh
         run: |
           $packageName = "theme-inject-windows-x64-v${{ steps.version.outputs.version }}"
+          $themesPackageName = "theme-inject-themes-v${{ steps.version.outputs.version }}"
           $packageDirectory = Join-Path "dist" $packageName
           New-Item -ItemType Directory -Path $packageDirectory -Force | Out-Null
           Copy-Item "target/release/theme-inject.exe" $packageDirectory
           Copy-Item "README.md" $packageDirectory
           Copy-Item "README.en.md" $packageDirectory
           Compress-Archive -Path "$packageDirectory/*" -DestinationPath "dist/$packageName.zip" -CompressionLevel Optimal
-          Get-Item "target/release/theme-inject.exe", "dist/$packageName.zip" | Select-Object Name,Length
+          $zip = "dist/$packageName.zip"
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          "$hash  $packageName.zip" | Set-Content -Path "$zip.sha256" -NoNewline -Encoding ascii
+          $themeFiles = @(Get-ChildItem "themes" -File -Filter "*.zip")
+          if ($themeFiles.Count -eq 0) { throw "themes 目录中没有可发布的主题 ZIP" }
+          $themesZip = "dist/$themesPackageName.zip"
+          Compress-Archive -LiteralPath $themeFiles.FullName -DestinationPath $themesZip -CompressionLevel Optimal
+          $themesHash = (Get-FileHash -Algorithm SHA256 $themesZip).Hash.ToLowerInvariant()
+          "$themesHash  $themesPackageName.zip" | Set-Content -Path "$themesZip.sha256" -NoNewline -Encoding ascii
+          Get-Item "target/release/theme-inject.exe", $zip, "$zip.sha256", $themesZip, "$themesZip.sha256" | Select-Object Name,Length
 
       - name: 上传安装包
         uses: actions/upload-artifact@v4
         with:
           name: theme-inject-windows-x64-v${{ steps.version.outputs.version }}
-          path: dist/*.zip
+          path: |
+            dist/theme-inject-windows-x64-v${{ steps.version.outputs.version }}.zip
+            dist/theme-inject-windows-x64-v${{ steps.version.outputs.version }}.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: 上传主题合集
+        uses: actions/upload-artifact@v4
+        with:
+          name: theme-inject-themes-v${{ steps.version.outputs.version }}
+          path: |
+            dist/theme-inject-themes-v${{ steps.version.outputs.version }}.zip
+            dist/theme-inject-themes-v${{ steps.version.outputs.version }}.zip.sha256
           if-no-files-found: error
           retention-days: 14
 
@@ -68,5 +100,7 @@ jobs:
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: Theme Inject v${{ steps.version.outputs.version }}
-          files: dist/*.zip
+          files: |
+            dist/*.zip
+            dist/*.sha256
           generate_release_notes: true

@@ -16,6 +16,7 @@ use crate::theme::ThemeManifest;
 const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_UNPACKED_BYTES: u64 = 80 * 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 15 * 1024 * 1024;
+const MAX_PET_FILE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_CSS_BYTES: u64 = 256 * 1024;
 const MAX_FILES: usize = 100;
 
@@ -266,7 +267,12 @@ impl ThemePackageManager {
         {
             bail!("预览图片无效或超过 15 MB");
         }
-        thumbnail_data_url(&path, 256)
+        thumbnail_data_url(&path, 256).or_else(|thumbnail_error| {
+            // 某些相机/设计软件导出的 JPG（例如 CMYK 或特殊元数据）无法由
+            // image 的缩略图解码器处理，但浏览器仍能直接显示原图。
+            raw_image_data_url(&path)
+                .with_context(|| format!("无法解码预览图片：{thumbnail_error:#}"))
+        })
     }
 
     pub fn theme_thumbnail_data_url(
@@ -387,7 +393,8 @@ impl ThemePackageManager {
 }
 
 fn thumbnail_data_url(path: &Path, max_dimension: u32) -> anyhow::Result<String> {
-    let image = image::open(path).context("无法解码预览图片")?;
+    let bytes = fs::read(path).context("无法读取预览图片")?;
+    let image = image::load_from_memory(&bytes).context("无法解码预览图片")?;
     let thumbnail = if image.width() > max_dimension || image.height() > max_dimension {
         image.resize(max_dimension, max_dimension, FilterType::Triangle)
     } else {
@@ -400,6 +407,30 @@ fn thumbnail_data_url(path: &Path, max_dimension: u32) -> anyhow::Result<String>
     Ok(format!(
         "data:image/png;base64,{}",
         base64::engine::general_purpose::STANDARD.encode(bytes.into_inner())
+    ))
+}
+
+fn raw_image_data_url(path: &Path) -> anyhow::Result<String> {
+    let mime = match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        Some("bmp") => "image/bmp",
+        _ => bail!("不支持的预览图片格式"),
+    };
+    let bytes = fs::read(path).context("无法读取预览图片")?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_FILE_BYTES {
+        bail!("预览图片为空或超过 15 MB");
+    }
+    Ok(format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
     ))
 }
 
@@ -459,7 +490,13 @@ fn import_zip(store: &ThemeStore, path: &Path) -> anyhow::Result<ThemeManifest> 
                 bail!("主题包不能包含符号链接");
             }
             total = total.saturating_add(entry.size());
-            if entry.size() > MAX_FILE_BYTES || total > MAX_UNPACKED_BYTES {
+            let pet_file = is_pet_package_file(&relative);
+            let file_limit = if pet_file {
+                MAX_PET_FILE_BYTES
+            } else {
+                MAX_FILE_BYTES
+            };
+            if entry.size() > file_limit || total > MAX_UNPACKED_BYTES {
                 bail!("主题包解压大小超过 80 MB 或单文件超过 15 MB");
             }
             if relative == Path::new("custom.css") && entry.size() > MAX_CSS_BYTES {
@@ -482,6 +519,20 @@ fn import_zip(store: &ThemeStore, path: &Path) -> anyhow::Result<ThemeManifest> 
             &fs::read(staging.join("theme.json")).context("主题包缺少 theme.json")?,
         )?;
         validate_packaged_files(&staging, &theme)?;
+        let bundled_pet = theme
+            .companion_pet_id()
+            .map(|id| -> anyhow::Result<_> {
+                let root = staging.join("pets").join(id);
+                if root.exists() {
+                    crate::pet::validate_pet_directory(&root)?;
+                    Ok(Some((id.to_string(), root)))
+                } else {
+                    Ok(None)
+                }
+            })
+            .transpose()?
+            .flatten();
+        validate_bundled_pet_entries(&staging, theme.companion_pet_id())?;
         if theme.id.starts_with("builtin.") {
             bail!("导入主题不能使用 builtin. 命名空间");
         }
@@ -489,8 +540,32 @@ fn import_zip(store: &ThemeStore, path: &Path) -> anyhow::Result<ThemeManifest> 
         if target.exists() {
             bail!("主题 {} 已经安装", theme.id);
         }
-        fs::rename(&staging, &target)?;
-        store.save(&theme)?;
+        let mut imported_pet = None;
+        if let Some((pet_id, pet_root)) = bundled_pet {
+            fs::create_dir_all(&store.paths.pets)?;
+            let pet_target = store.paths.pets.join(&pet_id);
+            if !pet_target.exists() {
+                fs::rename(&pet_root, &pet_target)?;
+                imported_pet = Some(pet_target);
+            }
+        }
+        let pets_dir = staging.join("pets");
+        if pets_dir.exists() {
+            fs::remove_dir_all(&pets_dir)?;
+        }
+        if let Err(error) = fs::rename(&staging, &target) {
+            if let Some(imported_pet) = imported_pet.as_ref() {
+                let _ = fs::remove_dir_all(imported_pet);
+            }
+            return Err(error.into());
+        }
+        if let Err(error) = store.save(&theme) {
+            let _ = fs::remove_dir_all(&target);
+            if let Some(imported_pet) = imported_pet.as_ref() {
+                let _ = fs::remove_dir_all(imported_pet);
+            }
+            return Err(error);
+        }
         Ok(theme)
     })();
     if result.is_err() {
@@ -516,12 +591,28 @@ fn export_zip(store: &ThemeStore, id: &str, path: &Path) -> anyhow::Result<()> {
         if root.join("preview.png").is_file() {
             files.insert("preview.png".into());
         }
+        if let Some(pet_id) = theme.companion_pet_id() {
+            let pet_root = store.paths.pets.join(pet_id);
+            crate::pet::validate_pet_directory(&pet_root)
+                .with_context(|| format!("主题关联的宠物 {pet_id} 不在宠物库或格式无效"))?;
+            files.insert(format!("pets/{pet_id}/pet.json"));
+            files.insert(format!("pets/{pet_id}/spritesheet.webp"));
+        }
         let mut total = 0u64;
         for relative in files {
-            let file = root.join(&relative);
+            let file = if let Some(pet_relative) = relative.strip_prefix("pets/") {
+                store.paths.pets.join(pet_relative)
+            } else {
+                root.join(&relative)
+            };
             let metadata = fs::metadata(&file)?;
             total = total.saturating_add(metadata.len());
-            if metadata.len() > MAX_FILE_BYTES || total > MAX_UNPACKED_BYTES {
+            let file_limit = if is_pet_package_file(Path::new(&relative)) {
+                MAX_PET_FILE_BYTES
+            } else {
+                MAX_FILE_BYTES
+            };
+            if metadata.len() > file_limit || total > MAX_UNPACKED_BYTES {
                 bail!("主题资源总大小超过导出限制");
             }
             add_file_to_zip(&mut zip, &file, &relative)?;
@@ -583,6 +674,7 @@ fn allowed_file(path: &Path) -> bool {
     relative == "theme.json"
         || relative == "custom.css"
         || relative == "preview.png"
+        || is_pet_package_file(path)
         || (relative.starts_with("assets/")
             && matches!(
                 path.extension()
@@ -591,6 +683,35 @@ fn allowed_file(path: &Path) -> bool {
                     .as_deref(),
                 Some("png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp")
             ))
+}
+
+fn is_pet_package_file(path: &Path) -> bool {
+    let parts = path.components().collect::<Vec<_>>();
+    parts.len() == 3
+        && parts[0].as_os_str() == "pets"
+        && matches!(
+            parts[2].as_os_str().to_str(),
+            Some("pet.json" | "spritesheet.webp")
+        )
+        && parts[1]
+            .as_os_str()
+            .to_str()
+            .is_some_and(|id| crate::pet::validate_pet_id(id).is_ok())
+}
+
+fn validate_bundled_pet_entries(root: &Path, companion_id: Option<&str>) -> anyhow::Result<()> {
+    let pets = root.join("pets");
+    if !pets.exists() {
+        return Ok(());
+    }
+    let companion_id = companion_id.context("主题包包含宠物文件但主题没有 companionPetId")?;
+    for entry in fs::read_dir(&pets)? {
+        let entry = entry?;
+        if !entry.path().is_dir() || entry.file_name() != companion_id {
+            bail!("主题包只能携带当前关联宠物 {companion_id}");
+        }
+    }
+    Ok(())
 }
 
 fn copy_directory(source: &Path, target: &Path) -> anyhow::Result<()> {
@@ -628,6 +749,7 @@ fn validate_staging_session(session: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::{ImageFormat, Rgba, RgbaImage};
 
     fn theme_store() -> (tempfile::TempDir, ThemeStore) {
         let temp = tempfile::tempdir().unwrap();
@@ -647,6 +769,28 @@ mod tests {
             zip.write_all(b"payload").unwrap();
         }
         zip.finish().unwrap();
+    }
+
+    fn write_test_pet(root: &Path, marker: u8) {
+        fs::create_dir_all(root).unwrap();
+        fs::write(
+            root.join("pet.json"),
+            br#"{"id":"theme-pet","displayName":"Theme Pet","description":"Bundled","spriteVersionNumber":2,"spritesheetPath":"spritesheet.webp"}"#,
+        )
+        .unwrap();
+        let mut image = RgbaImage::new(crate::pet::PET_WIDTH, crate::pet::PET_V2_HEIGHT);
+        for (row, used) in [6u32, 8, 8, 4, 5, 8, 6, 6, 6, 8, 8].into_iter().enumerate() {
+            for column in 0..used {
+                image.put_pixel(
+                    column * crate::pet::PET_CELL_WIDTH + 20,
+                    row as u32 * crate::pet::PET_CELL_HEIGHT + 20,
+                    Rgba([marker, 40, 60, 255]),
+                );
+            }
+        }
+        image
+            .save_with_format(root.join("spritesheet.webp"), ImageFormat::WebP)
+            .unwrap();
     }
 
     #[test]
@@ -678,6 +822,32 @@ mod tests {
         let thumbnail = image::load_from_memory(&bytes).unwrap();
         assert!(thumbnail.width() <= 256 && thumbnail.height() <= 256);
         assert!(thumbnail.color().has_alpha());
+    }
+
+    #[test]
+    fn staging_jpeg_reference_returns_browser_preview_data() {
+        let (_temp, store) = theme_store();
+        let manager = ThemePackageManager::new(store);
+        let mut source = image::RgbImage::new(640, 360);
+        for pixel in source.pixels_mut() {
+            *pixel = image::Rgb([230, 90, 120]);
+        }
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(source)
+            .write_to(&mut encoded, ImageFormat::Jpeg)
+            .unwrap();
+        let (session, path) = manager
+            .stage_image_bytes("jpeg-reference", "jpg", encoded.get_ref())
+            .unwrap();
+        let data_url = manager.staging_thumbnail_data_url(&session, &path).unwrap();
+        assert!(
+            data_url.starts_with("data:image/png;base64,")
+                || data_url.starts_with("data:image/jpeg;base64,")
+        );
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data_url.split_once(',').unwrap().1)
+            .unwrap();
+        assert!(image::load_from_memory(&bytes).is_ok());
     }
 
     #[test]
@@ -810,6 +980,57 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"assets/logo.png".to_string()));
         assert!(!names.contains(&"assets/obsolete.png".to_string()));
+    }
+
+    #[test]
+    fn companion_pet_round_trips_with_theme_package() {
+        let (temp, source) = theme_store();
+        let mut theme = ThemeManifest::neutral_dark();
+        theme.id = "local.pet-theme".into();
+        theme.set_companion_pet_id(Some("theme-pet")).unwrap();
+        source.save(&theme).unwrap();
+        write_test_pet(&source.paths.pets.join("theme-pet"), 20);
+        let archive = temp.path().join("pet-theme.zip");
+        export_zip(&source, &theme.id, &archive).unwrap();
+
+        let mut zip = zip::ZipArchive::new(File::open(&archive).unwrap()).unwrap();
+        assert!(zip.by_name("pets/theme-pet/pet.json").is_ok());
+        assert!(zip.by_name("pets/theme-pet/spritesheet.webp").is_ok());
+        drop(zip);
+
+        let target_paths = crate::storage::AppPaths::from_root(temp.path().join("target"));
+        target_paths.ensure().unwrap();
+        let target = ThemeStore::new(target_paths.clone());
+        let imported = import_zip(&target, &archive).unwrap();
+        assert_eq!(imported.companion_pet_id(), Some("theme-pet"));
+        assert_eq!(
+            crate::pet::validate_pet_directory(&target_paths.pets.join("theme-pet"))
+                .unwrap()
+                .id,
+            "theme-pet"
+        );
+        assert!(!target_paths.themes.join(&theme.id).join("pets").exists());
+    }
+
+    #[test]
+    fn bundled_pet_does_not_replace_existing_library_pet() {
+        let (temp, source) = theme_store();
+        let mut theme = ThemeManifest::neutral_dark();
+        theme.id = "local.pet-conflict".into();
+        theme.set_companion_pet_id(Some("theme-pet")).unwrap();
+        source.save(&theme).unwrap();
+        write_test_pet(&source.paths.pets.join("theme-pet"), 20);
+        let archive = temp.path().join("pet-conflict.zip");
+        export_zip(&source, &theme.id, &archive).unwrap();
+
+        let target_paths = crate::storage::AppPaths::from_root(temp.path().join("conflict-target"));
+        target_paths.ensure().unwrap();
+        write_test_pet(&target_paths.pets.join("theme-pet"), 220);
+        let before = fs::read(target_paths.pets.join("theme-pet/spritesheet.webp")).unwrap();
+        let target = ThemeStore::new(target_paths.clone());
+        import_zip(&target, &archive).unwrap();
+        let after = fs::read(target_paths.pets.join("theme-pet/spritesheet.webp")).unwrap();
+        assert_eq!(after, before);
     }
 
     #[test]

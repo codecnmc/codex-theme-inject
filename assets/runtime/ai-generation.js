@@ -53,9 +53,6 @@
       await cancelPreviewSessions(previousAssets);
       if (!generationIsActive(epoch)) return;
     }
-    await clearAiReference(false);
-    if (!generationIsActive(epoch)) return;
-    if (!studioOpen) return;
     if (!resourcePlansOnly) {
       if (aiStudioMode === "edit") mergeGeneratedAssets(result.theme, result.assets);
       else {
@@ -288,7 +285,7 @@
   function openStudio() {
     if (destroyed) return;
     activateAiWorkspace(draft);
-    if (!studioOpen) {
+    if (!studioOpen && !studioBaseline) {
       aiThemeName = draft.name || "";
       aiThemeDescription = draft.description || "";
       studioBaseline = {

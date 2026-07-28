@@ -18,6 +18,7 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const DATA_URL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const FILE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const GENERATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(25 * 60);
+const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_CONCURRENT_REQUESTS: usize = 8;
 
 pub type RpcFuture = Pin<Box<dyn Future<Output = anyhow::Result<Value>> + Send>>;
@@ -155,7 +156,17 @@ pub async fn install(
                     }
                 }
                 event = session.next_event() => {
-                    let Ok(Some(event)) = event else { break };
+                    let event = match event {
+                        Ok(Some(event)) => event,
+                        Ok(None) => {
+                            crate::diagnostic::log("bridge.session_closed", json!({}));
+                            break;
+                        }
+                        Err(error) => {
+                            crate::diagnostic::log("bridge.session_failed", json!({ "message": format!("{error:#}") }));
+                            break;
+                        }
+                    };
                     if event.get("method").and_then(Value::as_str) != Some("Runtime.bindingCalled") {
                         continue;
                     }
@@ -195,7 +206,7 @@ pub async fn install(
                     } else {
                         None
                     };
-                    let generation_permit = if matches!(request.method.as_str(), "ai.generate" | "ai.resource.generate") {
+                    let generation_permit = if matches!(request.method.as_str(), "ai.generate" | "ai.resource.generate" | "ai.pet.generate" | "ai.pet.action.generate") {
                         match generation_permit.clone().try_acquire_owned() {
                             Ok(permit) => Some(permit),
                             Err(_) => {
@@ -344,9 +355,18 @@ struct PendingResponse {
 
 fn request_timeout(method: &str) -> Duration {
     match method {
-        "ai.generate" | "ai.resource.generate" => GENERATION_REQUEST_TIMEOUT,
+        "ai.generate"
+        | "ai.resource.generate"
+        | "ai.pet.generate"
+        | "ai.pet.base.generate"
+        | "ai.pet.actions.generate"
+        | "ai.pet.publish"
+        | "ai.pet.action.generate" => GENERATION_REQUEST_TIMEOUT,
+        "ai.pet.action.prompts.suggest" => GENERATION_REQUEST_TIMEOUT,
         "theme.package.import"
         | "theme.package.export"
+        | "pet.library.import"
+        | "pet.library.export"
         | "theme.background.import"
         | "theme.asset.import"
         | "ai.reference.import"
@@ -354,7 +374,9 @@ fn request_timeout(method: &str) -> Duration {
         "theme.background.data"
         | "theme.preview.data"
         | "theme.preview.thumbnail"
-        | "theme.thumbnail" => DATA_URL_REQUEST_TIMEOUT,
+        | "theme.thumbnail"
+        | "pet.library.data" => DATA_URL_REQUEST_TIMEOUT,
+        "app.update.check" => UPDATE_CHECK_TIMEOUT,
         _ => DEFAULT_REQUEST_TIMEOUT,
     }
 }
@@ -379,6 +401,11 @@ fn valid_method(method: &str) -> bool {
         method,
         "theme.health"
             | "theme.window.chrome"
+            | "app.update.status"
+            | "app.update.check"
+            | "app.update.download"
+            | "app.update.cancel"
+            | "app.update.install"
             | "ai.settings.get"
             | "ai.settings.save"
             | "ai.log.get"
@@ -390,6 +417,15 @@ fn valid_method(method: &str) -> bool {
             | "ai.reference.upload"
             | "ai.generate"
             | "ai.resource.generate"
+            | "ai.pet.generate"
+            | "ai.pet.base.generate"
+            | "ai.pet.actions.generate"
+            | "ai.pet.publish"
+            | "ai.pet.restore"
+            | "ai.pet.discard"
+            | "ai.pet.action.generate"
+            | "ai.pet.action.prompts.suggest"
+            | "ai.pet.action.apply"
             | "theme.state.get"
             | "app.language.save"
             | "app.trigger.save"
@@ -403,6 +439,14 @@ fn valid_method(method: &str) -> bool {
             | "theme.package.export"
             | "theme.package.clone"
             | "theme.package.delete"
+            | "pet.library.list"
+            | "pet.library.data"
+            | "pet.library.import"
+            | "pet.library.export"
+            | "pet.library.delete"
+            | "pet.library.metadata"
+            | "pet.library.install"
+            | "theme.pet.bind"
             | "theme.background.import"
             | "theme.background.data"
             | "theme.preview.data"
@@ -433,10 +477,20 @@ mod tests {
         assert!(valid_method("theme.window.chrome"));
         assert!(valid_method("ai.generate"));
         assert!(valid_method("ai.resource.generate"));
+        assert!(valid_method("ai.pet.generate"));
+        assert!(valid_method("ai.pet.action.generate"));
+        assert!(valid_method("app.update.status"));
+        assert!(valid_method("app.update.install"));
+        assert!(valid_method("ai.pet.action.apply"));
         assert!(valid_method("app.trigger.save"));
         assert!(valid_method("app.language.save"));
         assert!(valid_method("app.trigger.icon.import"));
         assert!(valid_method("theme.package.metadata"));
+        assert!(valid_method("pet.library.list"));
+        assert!(valid_method("pet.library.data"));
+        assert!(valid_method("pet.library.metadata"));
+        assert!(valid_method("pet.library.install"));
+        assert!(valid_method("theme.pet.bind"));
         assert!(valid_method("ai.progress.get"));
         assert!(valid_method("ai.generation.cancel"));
         assert!(valid_method("ai.generation.restore"));
@@ -484,6 +538,10 @@ mod tests {
         );
         assert_eq!(
             request_timeout("theme.background.data"),
+            DATA_URL_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            request_timeout("pet.library.data"),
             DATA_URL_REQUEST_TIMEOUT
         );
         assert!(DATA_URL_REQUEST_TIMEOUT > request_timeout("theme.health"));
